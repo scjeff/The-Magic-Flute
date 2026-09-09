@@ -4,7 +4,7 @@ Passive Wi-Fi / Bluetooth survey using [Kismet](https://www.kismetwireless.net/)
 
 The program file is **`flute.py`**. 
 
-Named after Mozart’s *Die Zauberflöte* inspired by the moment when two of the main characters find each other by playing flutes.
+Named after Mozart’s *Die Zauberflöte*, inspired by the moment when two of the main characters find each other by playing flutes.
 
 Download it, attach a monitor-capable Wi-Fi adapter (and optionally Bluetooth + a USB GPS), run `--setup`, and collect receive-only observations with GPS tags.
 
