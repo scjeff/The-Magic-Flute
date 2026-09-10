@@ -10,12 +10,34 @@ Download it, attach a monitor-capable Wi-Fi adapter (and optionally Bluetooth + 
 
 Python 3.9+ stdlib only. No `pip` packages. Licensed under **GPL-3.0-or-later**.
 
-On each capture (and on `--check` / `--setup`) the tool looks for an IEEE MAC vendor file (`ieee_mac_vendors.csv`) next to `flute.py`. If that file is **missing** or **older than 180 days**, it **asks** whether to download a fresh copy from IEEE (MA-L + MA-M + MA-S, a few megabytes). The default is **no**, so an air-gapped host can continue without internet. If you decline and no file is present, `ieee_manufacturer` is **Unknown**. When the survey stops (Ctrl-C or `--duration`), every MAC is matched to whatever registry is on disk.
+On each capture (and on `--check` / `--setup`) the tool looks for vendor files next to `flute.py`:
+
+- `ieee_mac_vendors.csv` — IEEE MAC prefixes (MA-L, MA-M, MA-S, and IAB)
+- `bt_company_ids.csv` — Bluetooth SIG 16-bit company identifiers (used only when a BLE advertisement contains manufacturer data, AD type `0xFF`)
+
+If either file is **missing** or **older than 180 days**, it **asks** whether to download a refresh (a few megabytes). The default is **no**, so an air-gapped host can continue without internet.
+
+**A second IEEE prefix file will not fill in most Bluetooth manufacturers.** Modern BLE devices use *random/private addresses* (resolvable, non-resolvable, or static random). Those MACs are not IEEE OUIs, so no prefix registry can map them.
+
+What *does* identify an iPhone vs a Galaxy vs a Moto on a random BLE MAC is the **advertisement payload**: Bluetooth SIG company ID `0xFF` (Apple `0x004C`, Samsung `0x0075`, Motorola `0x0008`, Microsoft `0x0006`, Google `0x00E0`) and a few 16-bit UUIDs (Google Fast Pair `0xFE2C`). Kismet’s Linux HCI helper sees those bytes and **throws them away** — it only keeps the device name. The Magic Flute therefore:
+
+1. Looks up public / universally administered MACs in the IEEE file.
+2. Taps the same BlueZ management `DEVICE_FOUND` events Kismet uses and keeps the EIR (written to `ble_advertisements.jsonl`).
+3. Maps company ID `0xFF` through the SIG list (or Kismet’s `kismet_bluetooth_manuf.txt.gz`).
+4. Treats Fast Pair / Eddystone UUIDs as Android-class, not a specific OEM.
+5. Infers a vendor from an advertised name when it is unambiguous (Govee, LG webOS, Galaxy, iPhone, Moto, …).
+6. Copies a vendor onto a BLE sibling that shares the last five octets of a public BR/EDR MAC.
+7. Labels the rest `Random BLE address` or `Locally administered MAC` instead of guessing.
+
+The advertisement tap needs the same root/`cap_net_admin` Flute already uses. It does **not** pair, connect, or enumerate GATT. Captures taken before this tap have no EIR to replay; `--report-from` only helps if `ble_advertisements.jsonl` is in that directory.
+
+Google Fast Pair means “Android-class device” (Samsung, Motorola, Pixel, and many headphones). It does **not** name the OEM. Apple Continuity (`0x004C`) is the reliable iPhone/iPad/AirPods tell. Many phones send no name and no company ID; those stay `Random BLE address`.
 
 Non-interactive:
 
-- `--download-ieee` — fetch without asking (needs internet)
-- `--no-download-ieee` — never fetch; use the file on disk if any
+- `--download-ieee` — fetch IEEE + SIG files without asking (needs internet)
+- `--no-download-ieee` — never fetch; use the files on disk if any
+- `--report-from DIR` — rebuild reports from an existing capture (re-applies lookups; no new survey)
 
 ## Disclaimer — authorized use only
 
@@ -51,7 +73,7 @@ Any Linux host with:
 | Role           | What works                        | Notes                                                                                                                                          |
 | -------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | Wi-Fi          | USB adapter with **monitor mode** | Preferred. MediaTek mt76 / Panda-class (`mt7921u`, etc.) are well supported. Built-in Intel often works but is usually a poorer capture radio. |
-| Bluetooth      | Any BlueZ `hci` controller        | Built-in Intel AX-series is fine.                                                                                                              |
+| Bluetooth      | BlueZ `hci` and/or **Ubertooth One** | Built-in Intel is fine for names. An Ubertooth One sniffs BTLE advertisements (manufacturer IDs). `--setup` installs the helper, tools, and udev rules. |
 | GPS (optional) | USB NMEA receiver                 | GlobalSat BU-353S4 (Prolific `067b:2303`) is autodetected at 4800 baud. Other NMEA USB GPSes on `/dev/ttyUSB*` or `/dev/ttyACM*` work too.     |
 
 The script lists whatever is plugged in and lets you pick. You do not have to use this exact hardware.
@@ -62,7 +84,7 @@ The script lists whatever is plugged in and lets you pick. You do not have to us
 git clone <your-repo-url> flute
 cd flute
 
-# Install Kismet, add your user to kismet + dialout, set capture capabilities
+# Install Kismet, Ubertooth helper/tools/udev, groups, capabilities
 sudo python3 flute.py --setup
 # log out and back in if groups were added
 
@@ -73,7 +95,9 @@ python3 flute.py --check
 sudo python3 flute.py
 ```
 
-`--setup` uses `apt`, `dnf`, or `pacman` depending on the distro. On Pop!_OS, Ubuntu, and Debian, Kismet is often **not** in the default repos; setup adds the [official Kismet apt repository](https://www.kismetwireless.net/packages/) (release, then git/nightly if needed), then installs `kismet` plus `iw`, `rfkill`, and `gpsd`.
+`--setup` uses `apt`, `dnf`, or `pacman` depending on the distro. On Pop!_OS, Ubuntu, and Debian, Kismet is often **not** in the default repos; setup adds the [official Kismet apt repository](https://www.kismetwireless.net/packages/) (release, then git/nightly if needed), then installs `kismet` plus `iw`, `rfkill`, `gpsd`, and (when the packages exist) `kismet-capture-ubertooth-one`, `ubertooth`, and `ubertooth-firmware`. It also writes `/etc/udev/rules.d/99-flute-ubertooth.rules` so the Ubertooth USB device is `0660` for the `kismet` group.
+
+Do **not** run `ubertooth-util -i` on Ubuntu’s package — that flag enters ISP/DFU mode. Setup uses `ubertooth-util -v` only. If the stick shows USB id `1d50:6003`, unplug and re-insert it.
 
 ## What `--setup` and each capture do
 
@@ -81,16 +105,19 @@ Lessons from field use are built in:
 
 | Step                                                        | Why                                                                 |
 | ----------------------------------------------------------- | ------------------------------------------------------------------- |
-| Install Kismet + `kismet_cap_linux_wifi` / `linuxbluetooth` | Capture helpers                                                     |
-| `setcap cap_net_admin,cap_net_raw` on those helpers         | Monitor mode without full root                                      |
-| Add the login user to `kismet` and `dialout`                | Helpers + USB GPS (`/dev/ttyUSB0` is typically `root:dialout`)      |
+| Install Kismet + `kismet_cap_linux_wifi` / `linuxbluetooth` / `ubertooth_one` | Capture helpers |
+| `setcap cap_net_admin,cap_net_raw` on the Linux Wi-Fi/HCI helpers | Monitor mode without full root |
+| Add the login user to `kismet`, `dialout`, and `plugdev`    | Helpers + USB GPS + Ubertooth USB |
+| Ubertooth udev rule `99-flute-ubertooth.rules`              | Non-root can claim the sniffer (`1d50:6002`) |
 | `rfkill unblock` wifi and bluetooth                         | Soft-blocked radios (common on laptops) look like “no signal”       |
 | Remove leftover `kismon*` monitor interfaces                | A previous run can leave a VAP that needs root to delete            |
 | Unmanage **only** the chosen Wi-Fi iface in NetworkManager  | Ethernet stays up                                                   |
 | Write Kismet’s HTTP password under `$HOME/.kismet/`         | Live status / localhost UI                                          |
 | Skip GPS if the serial node is unreadable                   | Don’t hang Kismet; tell you to run `--setup` or sudo                |
 | Use **gpsd** when the puck speaks SiRF binary               | GlobalSat BU-353S4 often is not NMEA; Kismet serial cannot parse it |
-| Offer to refresh IEEE MAC vendors if missing or >180 days   | Asks first (default no) so air-gapped hosts are not blocked         |
+| Offer to refresh IEEE MAC vendors + BT SIG IDs if missing or >180 days | Asks first (default no) so air-gapped hosts are not blocked |
+| Label random BLE / locally administered MACs honestly       | Extra OUI files cannot identify privacy addresses                   |
+| Tap BlueZ `DEVICE_FOUND` EIR while Kismet runs              | Kismet HCI drops company IDs; this is how Apple/Samsung/Moto show up |
 | Restore the Wi-Fi iface when the run ends                   | Laptop networking comes back                                        |
 
 A hardware airplane/kill switch (**hard** rfkill) cannot be overridden. Flip the switch.
@@ -156,7 +183,7 @@ At start the script:
 
 1. Prints the authorized-use disclaimer. Type `YES` only if you have lawful authorization.
 2. Unblocks radios and cleans leftover monitor interfaces.
-3. If `ieee_mac_vendors.csv` is missing or older than 180 days, asks whether to download it (default **no**; needs internet if you say yes).
+3. If `ieee_mac_vendors.csv` or `bt_company_ids.csv` is missing or older than 180 days, asks whether to download them (default **no**; needs internet if you say yes).
 4. Lists wireless controllers and asks you to pick one (USB monitor-capable adapters are marked recommended).
 5. Lists Bluetooth controllers and asks you to pick one (or skip).
 6. Autodetects a USB NMEA GPS.
@@ -164,7 +191,7 @@ At start the script:
 8. Asks for **channel hop rate** (default `5`).
 9. Unmanages the chosen Wi-Fi interface from NetworkManager and starts Kismet.
 10. Prints GPS / device counts every 5 seconds. Press **Ctrl-C** to stop, or use `--duration`.
-11. Finalizes the `.kismet` log and writes reports, including IEEE `ieee_manufacturer`.
+11. Finalizes the `.kismet` log and writes reports, including `ieee_manufacturer`, `mac_kind`, `bt_company`, and `bt_uuids`.
 
 Live UI (localhost only): http://127.0.0.1:2501
 
@@ -211,15 +238,17 @@ sudo python3 flute.py \
 | ----------------------------------------------- | ------------------------------------------------------------------------ |
 | `--setup`                                       | Install packages, groups, and capabilities (needs sudo)                  |
 | `--check`                                       | Print environment + hardware; do not capture                             |
-| `--download-ieee`                               | Download/refresh `ieee_mac_vendors.csv` without asking (needs internet)  |
-| `--no-download-ieee`                            | Do not download the IEEE vendor file (offline / air-gapped)              |
+| `--download-ieee`                               | Download/refresh IEEE prefixes + Bluetooth SIG company IDs (needs internet) |
+| `--no-download-ieee`                            | Do not download vendor files (offline / air-gapped)                      |
+| `--report-from DIR`                             | Rebuild reports from an existing capture directory (no new survey)       |
 | `--i-have-roe`                                  | Confirm signed ROE / written authorization (required when not a TTY)     |
 | `--userid`                                      | Operator user ID (username or employee ID)                               |
 | `--operator-name NAME`                          | Operator full name                                                       |
 | `--test-name NAME`                              | Test / location name                                                     |
 | `--hop-rate N`                                  | Wi-Fi channel hops per second (default `5` = 200 ms/channel; range 1–20) |
 | `--wifi IFACE`                                  | Skip the Wi-Fi picker                                                    |
-| `--bluetooth hciX`                              | Skip the Bluetooth picker                                                |
+| `--bluetooth hci0` / `--bluetooth ubertooth-0`  | Skip the Bluetooth picker. Ubertooth also enables HCI unless `--no-hci`. |
+| `--no-hci`                                      | Do not add Linux HCI when Ubertooth is selected                          |
 | `--no-bluetooth`                                | Wi-Fi only                                                               |
 | `--gps-device /dev/ttyUSB0` / `--gps-baud 4800` | Override GPS                                                             |
 | `--no-gps`                                      | Do not attach GPS                                                        |
@@ -241,7 +270,8 @@ Default directory: `flute_YYYYMMDDTHHMMSSZ/`
 | `flute_report.json`     | Full structured result                                                          |
 | `flute_report.txt`      | Human-readable report                                                           |
 | `flute_report.md`       | Markdown report                                                                 |
-| `flute_devices.csv`     | Every device (MAC, SSID, `ieee_manufacturer`, signal, frequency, GPS, names) |
+| `flute_devices.csv`     | Every device (MAC, SSID, `ieee_manufacturer`, `mac_kind`, `bt_company`, `bt_uuids`, signal, frequency, GPS, names) |
+| `ble_advertisements.jsonl` | Raw BLE AD/EIR from the BlueZ tap (company IDs, UUIDs). Empty if the tap could not bind. |
 | `flute_wifi.csv`        | Wi-Fi subset                                                                    |
 | `flute_bluetooth.csv`   | Bluetooth subset                                                                |
 | `flute_gps_track.csv`   | Surveyor track (when a fix existed)                                             |
@@ -265,8 +295,13 @@ Do not commit capture output. Indoor GPS can take minutes or fail; the script ke
 | Leftover `kismon0`                           | `sudo iw dev kismon0 del` (the script tries; deleting a VAP needs net-admin)          |
 | Port 2501 in use                             | Another Kismet is running. Stop it or pass `--http-port`                              |
 | Bluetooth empty                              | `rfkill unblock bluetooth`; or `--no-bluetooth`                                       |
+| Ubertooth not listed / USB permission        | `sudo python3 flute.py --setup`, unplug/replug. Do not run `ubertooth-util -i` (ISP). |
+| Ubertooth USB id `1d50:6003`                 | DFU/ISP mode. Unplug and re-insert. Flash only if it stays there (`ubertooth-firmware`). |
+| Ubertooth finds few devices                  | It sniffs **channel 37 only** (firmware hangs if hopped). HCI still sees names on all ads. |
+| `--bluetooth ubertooth-0` shows 0 Bluetooth devices | Kismet launched Ubertooth but **dropped CRC-fail packets** (228 frames in the Cyber Lab run, 0 devices). Host libubertooth is API 1.06, stick firmware is 1.07. Flute now also enables Linux HCI unless you pass `--no-hci`. Re-run: `sudo python3 flute.py --bluetooth ubertooth-0` |
 | Hardware rfkill                              | Flip the airplane / wireless kill switch                                              |
 | IEEE vendor file missing / stale             | You will be asked before any download (default no). Use `--download-ieee` online, or `--no-download-ieee` offline |
+| Bluetooth `ieee_manufacturer` is Unknown / Random BLE address | Expected when the device sent no name and no manufacturer AD. Another MAC-prefix file will not help. Re-run a survey with current `flute.py` as root so the BlueZ EIR tap can see Apple `0x004C` / Samsung `0x0075` / Fast Pair. Old captures have no EIR to replay. |
 
 ## License
 
@@ -283,6 +318,7 @@ The GPL covers copyright of the software. It does **not** authorize wireless col
 ```
 flute.py               # setup, checks, Kismet launcher, reports (GPL-3.0-or-later)
 ieee_mac_vendors.csv   # IEEE OUI cache (optional download; not in git)
+bt_company_ids.csv     # Bluetooth SIG company IDs (optional download; not in git)
 README.md
 LICENSE                # GNU GPL v3
 .gitignore
