@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import gzip
 import io
 import grp
 import http.cookiejar
@@ -45,9 +46,11 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -85,7 +88,14 @@ USB_GPS_HINTS = {
     ("1546", "01a8"): "u-blox GPS",
 }
 PANDA_USB_IDS = {("0e8d", "7961"), ("0e8d", "7612"), ("148f", "5370"), ("148f", "5572")}
-NEEDED_GROUPS = ("kismet", "dialout")
+UBERTOOTH_USB_IDS = {("1d50", "6002"), ("1d50", "6003")}
+UBERTOOTH_UDEV_PATH = "/etc/udev/rules.d/99-flute-ubertooth.rules"
+UBERTOOTH_UDEV_RULE = """\
+# The Magic Flute — Ubertooth One (runtime 6002, DFU 6003)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6002", MODE="0660", GROUP="kismet", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6003", MODE="0660", GROUP="kismet", TAG+="uaccess"
+"""
+NEEDED_GROUPS = ("kismet", "dialout", "plugdev")
 MIN_PYTHON = (3, 9)
 DEB_BASE_PACKAGES = [
     "iw",
@@ -102,6 +112,13 @@ DEB_KISMET_PACKAGES = [
     "kismet",
     "kismet-capture-linux-wifi",
     "kismet-capture-linux-bluetooth",
+    "kismet-capture-ubertooth-one",
+]
+DEB_UBERTOOTH_PACKAGES = [
+    "ubertooth",
+    "ubertooth-firmware",
+    "libubertooth1",
+    "libbtbb1",
 ]
 DEB_PACKAGES = DEB_BASE_PACKAGES + DEB_KISMET_PACKAGES
 KISMET_APT_KEY_URL = "https://www.kismetwireless.net/repos/kismet-release.gpg.key"
@@ -118,16 +135,84 @@ KISMET_APT_CODENAMES = {
     "plucky",
     "resolute",
 }
-FEDORA_PACKAGES = ["kismet", "iw", "rfkill", "usbutils", "iproute", "gpsd", "gpsd-clients"]
-ARCH_PACKAGES = ["kismet", "iw", "usbutils", "iproute2", "gpsd"]
+FEDORA_PACKAGES = [
+    "kismet",
+    "iw",
+    "rfkill",
+    "usbutils",
+    "iproute",
+    "gpsd",
+    "gpsd-clients",
+    "ubertooth",
+]
+ARCH_PACKAGES = ["kismet", "iw", "usbutils", "iproute2", "gpsd", "ubertooth"]
 IEEE_OUI_SOURCES = (
     ("https://standards-oui.ieee.org/oui/oui.csv", 24),
     ("https://standards-oui.ieee.org/oui28/mam.csv", 28),
     ("https://standards-oui.ieee.org/oui36/oui36.csv", 36),
+    ("https://standards-oui.ieee.org/iab/iab.csv", 36),
 )
 IEEE_DB_NAME = "ieee_mac_vendors.csv"
+BT_SIG_DB_NAME = "bt_company_ids.csv"
+BLE_ADV_LOG_NAME = "ble_advertisements.jsonl"
+# Company IDs that identify a handset/OS vendor even on a random BLE MAC.
+# Chip vendors (Nordic, TI, Broadcom) are looked up too, but ranked lower.
+BT_PREFERRED_COMPANY_IDS = (
+    0x004C,  # Apple
+    0x0075,  # Samsung
+    0x0008,  # Motorola
+    0x0171,  # Lenovo (some Moto)
+    0x0006,  # Microsoft
+    0x00E0,  # Google
+)
+WELL_KNOWN_COMPANY = {
+    0x0006: "Microsoft",
+    0x0008: "Motorola",
+    0x004C: "Apple, Inc.",
+    0x0075: "Samsung Electronics Co. Ltd.",
+    0x00E0: "Google",
+    0x0171: "Lenovo",
+}
+# 16-bit UUIDs that survive MAC randomization. Fast Pair means Android-class,
+# not a specific OEM (Samsung, Motorola, Pixel, etc. all use it).
+WELL_KNOWN_UUID = {
+    0xFE2C: "Android (Google Fast Pair)",
+    0xFE9F: "Google",
+    0xFEAA: "Google (Eddystone)",
+}
+APPLE_ADV_TYPES = {
+    0x02: "iBeacon",
+    0x05: "AirDrop",
+    0x07: "AirPods",
+    0x09: "AirPlay",
+    0x0C: "Handoff",
+    0x0F: "AirPods",
+    0x10: "Nearby Info",
+    0x12: "Nearby Action",
+}
+MGMT_EV_DEVICE_FOUND = 0x0012
+BT_SIG_COMPANY_URL = (
+    "https://raw.githubusercontent.com/NordicSemiconductor/"
+    "bluetooth-numbers-database/master/v1/company_ids.json"
+)
 IEEE_DB_MAX_AGE_DAYS = 180
 HTTP_USER_AGENT = "The-Magic-Flute/1.0 (passive wireless survey; GPL-3.0-or-later)"
+NAME_VENDOR_HINTS = (
+    (re.compile(r"govee", re.I), "Govee"),
+    (re.compile(r"\[lg\]|webos|\blg\b.*tv", re.I), "LG Electronics"),
+    (re.compile(r"samsung|\bgalaxy\b|\b\[tv\]", re.I), "Samsung Electronics Co.,Ltd"),
+    (re.compile(r"iphone|ipad|airpods|\bapple\b", re.I), "Apple, Inc."),
+    (re.compile(r"motorola|\bmoto\b", re.I), "Motorola"),
+    (re.compile(r"google|nest\b|chromecast|\bpixel\b", re.I), "Google"),
+    (re.compile(r"xiaomi|redmi|mi\s?band", re.I), "Xiaomi Communications Co Ltd"),
+    (re.compile(r"huawei", re.I), "Huawei Technologies Co., Ltd"),
+    (re.compile(r"\bsony\b|wh-1000|wf-1000", re.I), "Sony Corporation"),
+    (re.compile(r"\bbose\b", re.I), "Bose Corporation"),
+    (re.compile(r"garmin", re.I), "Garmin International"),
+    (re.compile(r"fitbit", re.I), "Fitbit, Inc."),
+    (re.compile(r"espressif|esp32", re.I), "Espressif Inc."),
+    (re.compile(r"sscdiag|ssc_ble|silicon lab", re.I), "Silicon Laboratories"),
+)
 CAPTURE_BINS = (
     "kismet_cap_linux_wifi",
     "kismet_cap_linux_bluetooth",
@@ -273,6 +358,19 @@ def kg(obj: Any, *path: str, default: Any = "") -> Any:
     return default if cur is None else cur
 
 
+def _walk_json_values(obj: Any, key: str) -> list[Any]:
+    found: list[Any] = []
+    if isinstance(obj, dict):
+        if key in obj and obj[key] not in (None, ""):
+            found.append(obj[key])
+        for value in obj.values():
+            found.extend(_walk_json_values(value, key))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_walk_json_values(item, key))
+    return found
+
+
 def valid_coord(lat: Any, lon: Any) -> bool:
     try:
         lat_f = float(lat)
@@ -305,8 +403,9 @@ def print_banner() -> None:
     log("         and authorized devices operating outside an allowed area.")
     log("Wi-Fi  : receive-only monitor mode (no inject, deauth, or association).")
     log(
-        "Bluetooth: Kismet linuxbluetooth listens for BLE advertisements;"
-        " classic discovery uses HCI inquiry and does not pair or connect."
+        "Bluetooth: Linux HCI does an inquiry/LE scan (no pairing). "
+        "An Ubertooth One, if attached, sniffs BTLE advertisements on the air "
+        "and keeps manufacturer data that HCI drops."
     )
 
 
@@ -585,7 +684,7 @@ def _parse_ieee_assignment_csv(raw: bytes, default_bits: int) -> list[tuple[str,
 
 def download_ieee_oui_database(dest: Path) -> int:
     """Fetch MA-L / MA-M / MA-S CSVs from IEEE and write dest. Returns prefix count."""
-    log("Downloading IEEE MAC vendor registries (MA-L, MA-M, MA-S)...")
+    log("Downloading IEEE MAC vendor registries (MA-L, MA-M, MA-S, IAB)...")
     combined: dict[str, str] = {}
     for url, bits in IEEE_OUI_SOURCES:
         log(f"  {url}")
@@ -618,23 +717,40 @@ def ensure_ieee_oui_database(download: str = "ask") -> Path | None:
               "yes" (always fetch), or "no" (never fetch).
     """
     path = ieee_db_path()
+    bt_path = bt_sig_db_path()
     age = ieee_db_age_days(path)
-    if age is not None and age <= IEEE_DB_MAX_AGE_DAYS:
+    bt_age = ieee_db_age_days(bt_path)
+    ieee_ok = age is not None and age <= IEEE_DB_MAX_AGE_DAYS
+    bt_ok = bt_age is not None and bt_age <= IEEE_DB_MAX_AGE_DAYS
+    if ieee_ok:
         size_mb = path.stat().st_size / (1024 * 1024)
         log(
             f"IEEE vendor database OK ({size_mb:.1f} MiB, {age:.0f} days old) -> {path}",
             "ok",
         )
+    if bt_ok:
+        log(
+            f"Bluetooth SIG company IDs OK ({bt_age:.0f} days old) -> {bt_path}",
+            "ok",
+        )
+    if ieee_ok and bt_ok:
         return path
 
-    if age is None:
-        reason = f"IEEE vendor database not found at {path}."
-    else:
-        reason = (
-            f"IEEE vendor database is {age:.0f} days old "
-            f"(limit {IEEE_DB_MAX_AGE_DAYS} days)."
+    reasons: list[str] = []
+    if not ieee_ok:
+        reasons.append(
+            f"IEEE MAC vendor file missing at {path}"
+            if age is None
+            else f"IEEE MAC vendor file is {age:.0f} days old (limit {IEEE_DB_MAX_AGE_DAYS})"
         )
-    log(reason, "warn")
+    if not bt_ok:
+        reasons.append(
+            f"Bluetooth SIG company-id file missing at {bt_path}"
+            if bt_age is None
+            else f"Bluetooth SIG company-id file is {bt_age:.0f} days old (limit {IEEE_DB_MAX_AGE_DAYS})"
+        )
+    for reason in reasons:
+        log(reason + ".", "warn")
 
     should_fetch = download == "yes"
     if download == "ask":
@@ -646,30 +762,37 @@ def ensure_ieee_oui_database(download: str = "ask") -> Path | None:
             )
         else:
             print()
-            print("A fresh copy is a few megabytes from standards-oui.ieee.org.")
-            print("Skip this if this host has no internet; an existing file will be kept.")
-            should_fetch = ask_yes_no("Download IEEE MAC vendor database now?", default=False)
+            print("IEEE MAC prefixes (MA-L/M/S + IAB) plus Bluetooth SIG company IDs.")
+            print("A few megabytes; skip if this host has no internet.")
+            should_fetch = ask_yes_no(
+                "Download vendor databases now?", default=False
+            )
 
     if not should_fetch:
         if path.is_file() and path.stat().st_size:
-            log("Keeping the existing IEEE vendor database (no download).", "ok")
+            log("Keeping existing vendor database files (no download).", "ok")
             return path
         log(
-            "No IEEE vendor database on disk. ieee_manufacturer will be Unknown "
-            "until you download one (re-run with network, or --download-ieee).",
+            "No IEEE vendor database on disk. Public MACs will be Unknown; "
+            "random BLE addresses will still be labeled. "
+            "Re-run with network or --download-ieee to fetch prefixes.",
             "warn",
         )
         return None
 
     try:
-        download_ieee_oui_database(path)
-        return path
+        if not ieee_ok:
+            download_ieee_oui_database(path)
+        if not bt_ok:
+            download_bt_company_ids(bt_path)
+        return path if path.is_file() else None
     except Exception as exc:
         if path.is_file() and path.stat().st_size:
-            log(f"IEEE download failed ({exc}); keeping the existing file.", "warn")
+            log(f"Vendor database download failed ({exc}); keeping existing files.", "warn")
             return path
         log(
-            f"IEEE download failed ({exc}). Manufacturer column will be Unknown.",
+            f"Vendor database download failed ({exc}). "
+            "Manufacturer column will use local Kismet BT IDs and names only.",
             "warn",
         )
         return None
@@ -711,9 +834,537 @@ def lookup_ieee_manufacturer(mac: str, table: dict[str, str]) -> str:
     return "Unknown"
 
 
-def apply_ieee_manufacturers(devices: list[dict[str, Any]], table: dict[str, str]) -> None:
+def bt_sig_db_path() -> Path:
+    return app_dir() / BT_SIG_DB_NAME
+
+
+def download_bt_company_ids(dest: Path) -> int:
+    log(f"Downloading Bluetooth SIG company identifiers...")
+    raw = _http_get(BT_SIG_COMPANY_URL)
+    payload = json.loads(raw.decode("utf-8", errors="replace"))
+    rows: list[tuple[str, str]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code")
+            name = (item.get("name") or "").strip()
+            if code is None or not name:
+                continue
+            rows.append((f"{int(code):04X}", name))
+    if not rows:
+        raise RuntimeError("Bluetooth SIG company-id list parsed to zero rows")
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+    with tmp.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["id", "vendor"])
+        for hid, name in sorted(rows):
+            writer.writerow([hid, name])
+    os.replace(tmp, dest)
+    log(f"Bluetooth SIG company IDs: {len(rows)} -> {dest}", "ok")
+    return len(rows)
+
+
+def load_kismet_bt_company_ids() -> dict[int, str]:
+    table: dict[int, str] = {}
+    path = Path("/usr/share/kismet/kismet_bluetooth_manuf.txt.gz")
+    if not path.is_file():
+        return table
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if len(line) < 5:
+                    continue
+                hid, name = line[:4], line[4:].strip()
+                if re.fullmatch(r"[0-9A-Fa-f]{4}", hid) and name:
+                    table[int(hid, 16)] = name
+    except OSError:
+        return table
+    return table
+
+
+def load_bt_company_table() -> dict[int, str]:
+    table = load_kismet_bt_company_ids()
+    path = bt_sig_db_path()
+    if not path.is_file():
+        return table
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            hid = re.sub(r"[^0-9A-Fa-f]", "", row.get("id") or "")
+            name = (row.get("vendor") or "").strip()
+            if len(hid) >= 1 and name:
+                table[int(hid, 16)] = name
+    return table
+
+
+def mac_locally_administered(mac: str) -> bool:
+    """IEEE U/L bit (bit 1 of the first octet). Locally administered MACs are not OUIs."""
+    parts = (mac or "").split(":")
+    try:
+        return bool(int(parts[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
+def classify_mac_kind(mac: str, phy: str = "", dtype: str = "") -> str:
+    """BLE random/private addresses are not IEEE OUIs (Core Spec Vol 6 Part B 1.3.2)."""
+    parts = (mac or "").split(":")
+    try:
+        first = int(parts[0], 16)
+    except (ValueError, IndexError):
+        return "unknown"
+    local = bool(first & 0x02)
+    msbs = (first >> 6) & 0x3
+    is_btle = "btle" in (dtype or "").lower() or (
+        "blue" in (phy or "").lower() and "br/edr" not in (dtype or "").lower()
+    )
+    if is_btle:
+        if msbs == 1:
+            return "ble-rpa"
+        if msbs == 3:
+            return "ble-static-random"
+        if msbs == 0 and local:
+            return "ble-nrpa"
+        if local:
+            return "ble-random"
+        return "ble-public"
+    if local:
+        return "locally-administered"
+    return "public"
+
+
+def _as_ad_bytes(scan_data: Any) -> bytes:
+    if isinstance(scan_data, (bytes, bytearray)):
+        return bytes(scan_data)
+    if isinstance(scan_data, (list, tuple)) and scan_data:
+        try:
+            return bytes(int(x) & 0xFF for x in scan_data)
+        except (TypeError, ValueError):
+            return b""
+    if isinstance(scan_data, str) and scan_data.strip():
+        hexstr = re.sub(r"[^0-9A-Fa-f]", "", scan_data)
+        if len(hexstr) >= 2 and len(hexstr) % 2 == 0:
+            try:
+                return bytes.fromhex(hexstr)
+            except ValueError:
+                return b""
+    return b""
+
+
+def parse_ble_ad_fields(scan_data: Any) -> dict[str, Any]:
+    """Parse BLE AD/EIR: company IDs, 16-bit UUIDs, name, Apple Continuity type."""
+    data = _as_ad_bytes(scan_data)
+    out: dict[str, Any] = {
+        "company_ids": [],
+        "uuids": [],
+        "name": "",
+        "apple_types": [],
+    }
+    i = 0
+    while i < len(data):
+        ln = data[i]
+        if ln == 0:
+            break
+        if i + 1 + ln > len(data):
+            break
+        ad_type = data[i + 1]
+        payload = data[i + 2 : i + 1 + ln]
+        if ad_type == 0xFF and len(payload) >= 2:
+            cid = int(payload[0]) | (int(payload[1]) << 8)
+            if cid not in out["company_ids"]:
+                out["company_ids"].append(cid)
+            if cid == 0x004C and len(payload) >= 3:
+                label = APPLE_ADV_TYPES.get(payload[2])
+                if label and label not in out["apple_types"]:
+                    out["apple_types"].append(label)
+        elif ad_type in (0x02, 0x03, 0x14) and len(payload) >= 2:
+            for j in range(0, len(payload) - 1, 2):
+                uuid = int(payload[j]) | (int(payload[j + 1]) << 8)
+                if uuid not in out["uuids"]:
+                    out["uuids"].append(uuid)
+        elif ad_type == 0x16 and len(payload) >= 2:
+            uuid = int(payload[0]) | (int(payload[1]) << 8)
+            if uuid not in out["uuids"]:
+                out["uuids"].append(uuid)
+        elif ad_type in (0x08, 0x09) and payload and not out["name"]:
+            out["name"] = payload.decode("utf-8", errors="replace").rstrip("\x00")
+        i += 1 + ln
+    return out
+
+
+def parse_ble_company_id(scan_data: Any) -> int | None:
+    """Company ID from BLE AD type 0xFF (little-endian), if advertisement bytes exist."""
+    ids = parse_ble_ad_fields(scan_data).get("company_ids") or []
+    return int(ids[0]) if ids else None
+
+
+def vendor_from_company_ids(
+    cids: list[int], companies: dict[int, str]
+) -> tuple[int | None, str]:
+    if not cids:
+        return None, ""
+    ordered = [c for c in BT_PREFERRED_COMPANY_IDS if c in cids]
+    ordered.extend(c for c in cids if c not in ordered)
+    for cid in ordered:
+        name = companies.get(cid) or WELL_KNOWN_COMPANY.get(cid, "")
+        if name:
+            return cid, name
+    return ordered[0], ""
+
+
+def vendor_from_uuids(uuids: list[int]) -> str:
+    for uid in uuids:
+        name = WELL_KNOWN_UUID.get(uid)
+        if name:
+            return name
+    return ""
+
+
+def _parse_btle_adv_payload(pdu: bytes) -> dict[str, Any] | None:
+    """ADV_IND / ADV_NONCONN / SCAN_RSP / ADV_SCAN_IND: AdvA + AD structures."""
+    if len(pdu) < 8:
+        return None
+    hdr = pdu[0]
+    ptype = hdr & 0x0F
+    if ptype not in {0x00, 0x02, 0x04, 0x06}:
+        return None
+    length = pdu[1] & 0x3F
+    body = pdu[2:]
+    if length:
+        body = body[:length]
+    if len(body) < 6:
+        return None
+    mac = ":".join(f"{b:02X}" for b in body[:6])
+    fields = parse_ble_ad_fields(body[6:])
+    fields["mac"] = mac
+    return fields
+
+
+def parse_ubertooth_or_btle_packet(blob: bytes) -> dict[str, Any] | None:
+    """Pull AdvA + AD from a Kismet BTLE/Ubertooth packet blob."""
+    if not blob:
+        return None
+    aa = bytes.fromhex("d6be898e")
+    idx = blob.find(aa)
+    if idx >= 0:
+        parsed = _parse_btle_adv_payload(blob[idx + 4 :])
+        if parsed:
+            return parsed
+    # usb_pkt_rx: 14-byte header then 50-byte data (Ubertooth)
+    if len(blob) >= 22:
+        parsed = _parse_btle_adv_payload(blob[14:])
+        if parsed:
+            return parsed
+        if blob[14:18] == aa:
+            parsed = _parse_btle_adv_payload(blob[18:])
+            if parsed:
+                return parsed
+    return _parse_btle_adv_payload(blob)
+
+
+def extract_btle_advertisements_from_db(db_path: Path) -> dict[str, dict[str, Any]]:
+    """Recover manufacturer AD from logged BTLE/Ubertooth packets."""
+    import sqlite3
+
+    by_mac: dict[str, dict[str, Any]] = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return by_mac
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {r[0] for r in cur.fetchall()}
+    if "packets" not in tables:
+        conn.close()
+        return by_mac
+    try:
+        cur.execute("SELECT packet, sourcemac FROM packets WHERE packet IS NOT NULL")
+    except sqlite3.Error:
+        conn.close()
+        return by_mac
+    for row in cur.fetchall():
+        blob = row["packet"]
+        if not isinstance(blob, (bytes, bytearray)):
+            continue
+        parsed = parse_ubertooth_or_btle_packet(bytes(blob))
+        if not parsed:
+            continue
+        mac = (parsed.get("mac") or row["sourcemac"] or "").upper()
+        if not mac:
+            continue
+        by_mac[mac] = merge_ad_fields(by_mac.get(mac, {}), parsed)
+    conn.close()
+    return by_mac
+
+
+def merge_ad_fields(*parts: dict[str, Any]) -> dict[str, Any]:
+    merged = {"company_ids": [], "uuids": [], "name": "", "apple_types": []}
+    for part in parts:
+        if not part:
+            continue
+        for cid in part.get("company_ids") or []:
+            cid_i = int(cid)
+            if cid_i not in merged["company_ids"]:
+                merged["company_ids"].append(cid_i)
+        for uid in part.get("uuids") or []:
+            uid_i = int(uid, 16) if isinstance(uid, str) else int(uid)
+            if uid_i not in merged["uuids"]:
+                merged["uuids"].append(uid_i)
+        if not merged["name"] and part.get("name"):
+            merged["name"] = str(part["name"])
+        for label in part.get("apple_types") or []:
+            if label not in merged["apple_types"]:
+                merged["apple_types"].append(label)
+    return merged
+
+
+def infer_vendor_from_name(*parts: str) -> str:
+    blob = " ".join(p for p in parts if p)
+    if not blob.strip():
+        return ""
+    for pattern, vendor in NAME_VENDOR_HINTS:
+        if pattern.search(blob):
+            return vendor
+    return ""
+
+
+_UNMAPPED_VENDORS = frozenset(
+    {"", "Unknown", "Random BLE address", "Locally administered MAC"}
+)
+
+
+def _mac_tail40(mac: str) -> str:
+    hexmac = re.sub(r"[^0-9A-Fa-f]", "", mac or "").upper()
+    return hexmac[2:] if len(hexmac) >= 12 else ""
+
+
+def apply_ieee_manufacturers(
+    devices: list[dict[str, Any]],
+    table: dict[str, str],
+    bt_companies: dict[int, str] | None = None,
+    advertisements: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Fill ieee_manufacturer. Random BLE MACs are not in IEEE; use SIG ID / name / label."""
+    companies = bt_companies if bt_companies is not None else load_bt_company_table()
+    ads = advertisements or {}
     for rec in devices:
-        rec["ieee_manufacturer"] = lookup_ieee_manufacturer(str(rec.get("mac") or ""), table)
+        mac = str(rec.get("mac") or "")
+        kind = classify_mac_kind(mac, str(rec.get("phy") or ""), str(rec.get("type") or ""))
+        rec["mac_kind"] = kind
+        local = mac_locally_administered(mac)
+        random_ble = kind.startswith("ble-") and kind != "ble-public"
+        # U/L=1 is never an IEEE OUI. U/L=0 may still be a BLE random address whose
+        # random bits cleared that bit; only then is an OUI match used.
+        ieee = "Unknown" if local else lookup_ieee_manufacturer(mac, table)
+        if ieee != "Unknown" and random_ble:
+            rec["mac_kind"] = "ble-public"
+            random_ble = False
+        fields = merge_ad_fields(
+            parse_ble_ad_fields(rec.get("scan_data")),
+            ads.get(mac.upper(), {}),
+        )
+        cid, bt_co = vendor_from_company_ids(fields["company_ids"], companies)
+        pretty_company = ""
+        if cid is not None:
+            pretty_company = WELL_KNOWN_COMPANY.get(cid) or (
+                bt_co.split(" (")[0] if bt_co else ""
+            )
+        if cid == 0x004C and fields.get("apple_types"):
+            rec["bt_company"] = (
+                f"{pretty_company or 'Apple, Inc.'} ({', '.join(fields['apple_types'])})"
+            )
+        else:
+            rec["bt_company"] = bt_co or pretty_company
+        rec["bt_uuids"] = ";".join(f"{u:04X}" for u in fields.get("uuids") or [])
+        uuid_vendor = vendor_from_uuids(fields.get("uuids") or [])
+        inferred = infer_vendor_from_name(
+            str(rec.get("bt_name") or ""),
+            str(rec.get("machine_name") or ""),
+            str(rec.get("ssid") or ""),
+            str(fields.get("name") or ""),
+            str(rec.get("btle_uuid_vendor") or ""),
+        )
+        if ieee != "Unknown":
+            rec["ieee_manufacturer"] = ieee
+        elif pretty_company:
+            rec["ieee_manufacturer"] = pretty_company
+        elif inferred:
+            rec["ieee_manufacturer"] = inferred
+        elif uuid_vendor:
+            rec["ieee_manufacturer"] = uuid_vendor
+        elif random_ble:
+            rec["ieee_manufacturer"] = "Random BLE address"
+        elif local:
+            rec["ieee_manufacturer"] = "Locally administered MAC"
+        else:
+            rec["ieee_manufacturer"] = "Unknown"
+
+    # Dual-mode chips often keep the same 40-bit tail on BR/EDR (public OUI) and BLE.
+    by_tail: dict[str, list[dict[str, Any]]] = {}
+    for rec in devices:
+        tail = _mac_tail40(str(rec.get("mac") or ""))
+        if tail:
+            by_tail.setdefault(tail, []).append(rec)
+    for group in by_tail.values():
+        known = [
+            str(r.get("ieee_manufacturer") or "")
+            for r in group
+            if str(r.get("ieee_manufacturer") or "") not in _UNMAPPED_VENDORS
+        ]
+        if not known:
+            continue
+        vendor = known[0]
+        for rec in group:
+            if str(rec.get("ieee_manufacturer") or "") in _UNMAPPED_VENDORS:
+                rec["ieee_manufacturer"] = vendor
+
+
+def ble_adv_log_path(outdir: Path) -> Path:
+    return outdir / BLE_ADV_LOG_NAME
+
+
+def collect_advertisements(outdir: Path, db_path: Path | None = None) -> dict[str, dict[str, Any]]:
+    ads = load_ble_advertisements(ble_adv_log_path(outdir))
+    if db_path is not None:
+        from_pkts = extract_btle_advertisements_from_db(db_path)
+        for mac, fields in from_pkts.items():
+            ads[mac] = merge_ad_fields(ads.get(mac, {}), fields)
+    return ads
+
+
+def load_ble_advertisements(path: Path) -> dict[str, dict[str, Any]]:
+    """Merge JSONL advertisement taps (one DEVICE_FOUND / AD payload per line)."""
+    by_mac: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return by_mac
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return by_mac
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        mac = str(rec.get("mac") or "").upper()
+        if not mac:
+            continue
+        by_mac[mac] = merge_ad_fields(by_mac.get(mac, {}), rec)
+    return by_mac
+
+
+def _mgmt_addr_to_mac(bdaddr: bytes) -> str:
+    return ":".join(f"{b:02X}" for b in reversed(bdaddr))
+
+
+class BleEirTap:
+    """Listen on BlueZ MGMT for DEVICE_FOUND and keep the EIR Kismet discards.
+
+    kismet_cap_linux_bluetooth copies only the advertised name out of EIR.
+    Company IDs (Apple 0x004C, Samsung 0x0075, …) and UUIDs live in the same
+    event; this tap records them without starting a second discovery.
+    """
+
+    def __init__(self, path: Path, hci_index: int | None) -> None:
+        self.path = path
+        self.hci_index = hci_index
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.error = ""
+        self.seen = 0
+        self._sock: socket.socket | None = None
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.thread = threading.Thread(target=self._run, name="ble-eir-tap", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        dev_none = getattr(socket, "HCI_DEV_NONE", 0xFFFF)
+        channel = getattr(socket, "HCI_CHANNEL_CONTROL", 3)
+        try:
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
+            sock.bind((dev_none, channel))
+            sock.settimeout(0.5)
+        except OSError as exc:
+            self.error = str(exc)
+            return
+        self._sock = sock
+        buf = bytearray()
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                while not self.stop_event.is_set():
+                    try:
+                        chunk = sock.recv(2048)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    while len(buf) >= 6:
+                        opcode, index, length = struct.unpack_from("<HHH", buf, 0)
+                        need = 6 + length
+                        if len(buf) < need:
+                            break
+                        payload = bytes(buf[6:need])
+                        del buf[:need]
+                        if opcode != MGMT_EV_DEVICE_FOUND:
+                            continue
+                        if self.hci_index is not None and index != self.hci_index:
+                            continue
+                        rec = self._parse_device_found(payload)
+                        if rec is None:
+                            continue
+                        self.seen += 1
+                        handle.write(json.dumps(rec) + "\n")
+                        handle.flush()
+        except OSError as exc:
+            self.error = str(exc)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    @staticmethod
+    def _parse_device_found(payload: bytes) -> dict[str, Any] | None:
+        if len(payload) < 14:
+            return None
+        bdaddr, _addr_type, rssi, _flags, eir_len = struct.unpack_from("<6sBbIH", payload, 0)
+        eir = payload[14 : 14 + eir_len]
+        fields = parse_ble_ad_fields(eir)
+        mac = _mgmt_addr_to_mac(bdaddr)
+        if not mac:
+            return None
+        return {
+            "mac": mac,
+            "rssi": rssi,
+            "eir": eir.hex(),
+            "company_ids": fields["company_ids"],
+            "uuids": fields["uuids"],
+            "name": fields["name"],
+            "apple_types": fields["apple_types"],
+        }
 
 
 def collect_checks() -> list[Check]:
@@ -734,6 +1385,7 @@ def collect_checks() -> list[Check]:
         ("kismet", True),
         ("kismet_cap_linux_wifi", True),
         ("kismet_cap_linux_bluetooth", False),
+        ("kismet_cap_ubertooth_one", False),
         ("iw", True),
         ("rfkill", False),
     ):
@@ -855,6 +1507,37 @@ def collect_checks() -> list[Check]:
             critical=False,
         )
     )
+    uber_usb = [
+        u for u in iter_usb_vid_pid() if (u["vendor"], u["product"]) in UBERTOOTH_USB_IDS
+    ]
+    if uber_usb:
+        helper = shutil.which("kismet_cap_ubertooth_one")
+        writable = is_root() or any(
+            u.get("devnode") and Path(u["devnode"]).exists() and os.access(u["devnode"], os.W_OK)
+            for u in uber_usb
+        )
+        dfu = any(u["product"] == "6003" for u in uber_usb)
+        serial = uber_usb[0].get("serial") or ""
+        detail = (
+            f"Ubertooth One serial={serial or '-'} helper={'yes' if helper else 'NO'} "
+            f"usb-write={'yes' if writable else 'NO'}"
+        )
+        if dfu:
+            detail += " (DFU/ISP — unplug and re-insert)"
+        checks.append(
+            Check(
+                "ubertooth",
+                bool(helper) and writable and not dfu,
+                detail,
+                critical=False,
+                fixable=not helper or not writable,
+            )
+        )
+    else:
+        checks.append(
+            Check("ubertooth", True, "none attached (optional BTLE sniffer)", critical=False)
+        )
+
     leftover = leftover_monitor_ifaces()
     checks.append(
         Check(
@@ -1055,6 +1738,9 @@ def install_packages() -> bool:
                     "err",
                 )
                 return shutil.which("iw") is not None and shutil.which("kismet") is not None
+            extra = [p for p in DEB_UBERTOOTH_PACKAGES if apt_package_known(p)]
+            if extra:
+                kismet_pkgs = list(dict.fromkeys(kismet_pkgs + extra))
             proc = _apt_install(kismet_pkgs, env)
         elif manager == "dnf":
             proc = run_cmd(["dnf", "install", "-y", *packages], timeout=600)
@@ -1106,6 +1792,67 @@ def ensure_capture_caps() -> None:
             log(f"Set {NEEDED_CAPS} on {path}.", "ok")
         else:
             log((proc.stderr or f"setcap {name} failed").strip(), "warn")
+
+
+def ensure_ubertooth_setup() -> None:
+    """udev + tools so an Ubertooth One can be opened without a full-root USB claim."""
+    if not is_root():
+        return
+    helper = shutil.which("kismet_cap_ubertooth_one")
+    if helper:
+        log(f"Ubertooth capture helper: {helper}", "ok")
+    else:
+        log(
+            "kismet_cap_ubertooth_one is not installed. "
+            "It comes from the Kismet apt repo (kismet-capture-ubertooth-one).",
+            "warn",
+        )
+    group = "kismet" if group_exists("kismet") else ("plugdev" if group_exists("plugdev") else "")
+    rule = UBERTOOTH_UDEV_RULE
+    if group and group != "kismet":
+        rule = rule.replace('GROUP="kismet"', f'GROUP="{group}"')
+    dest = Path(UBERTOOTH_UDEV_PATH)
+    try:
+        dest.write_text(rule, encoding="utf-8")
+        dest.chmod(0o644)
+        log(f"Wrote Ubertooth udev rule -> {dest} (group {group or 'unchanged'})", "ok")
+    except OSError as exc:
+        log(f"Could not write {dest}: {exc}", "warn")
+        return
+    if shutil.which("udevadm"):
+        run_cmd(["udevadm", "control", "--reload-rules"])
+        run_cmd(["udevadm", "trigger", "--subsystem-match=usb"])
+    for usb in iter_usb_vid_pid():
+        if (usb["vendor"], usb["product"]) not in UBERTOOTH_USB_IDS:
+            continue
+        node = usb.get("devnode") or ""
+        if not node or not Path(node).exists():
+            continue
+        if group:
+            run_cmd(["chgrp", group, node])
+        os.chmod(node, 0o660)
+        log(f"USB node {node} mode 0660 group {group or 'keep'}.", "ok")
+        if usb["product"] == "6003":
+            log(
+                "Ubertooth is in DFU/ISP mode. Unplug and re-insert it "
+                "(do not run ubertooth-util -i; that enters ISP on some builds).",
+                "warn",
+            )
+    util = shutil.which("ubertooth-util")
+    if util:
+        # -v is firmware version. Do NOT pass -i: Ubuntu's ubertooth-util -i is ISP mode.
+        proc = run_cmd([util, "-v"], timeout=8)
+        ver = (proc.stdout or proc.stderr or "").strip().splitlines()
+        if proc.returncode == 0 and ver:
+            log("Ubertooth firmware: " + ver[0][:120], "ok")
+        elif proc.returncode != 0:
+            log(
+                "ubertooth-util -v failed. Unplug/replug the Ubertooth. "
+                "Flash only if it stays in DFU: ubertooth-dfu from the ubertooth-firmware package.",
+                "warn",
+            )
+    elif any((u["vendor"], u["product"]) in UBERTOOTH_USB_IDS for u in iter_usb_vid_pid()):
+        log("ubertooth tools not installed; udev is in place for the next capture.", "warn")
 
 
 def leftover_monitor_ifaces(phy: str = "") -> list[str]:
@@ -1217,8 +1964,8 @@ def run_check(download_ieee: str = "ask") -> int:
 
 def run_setup(download_ieee: str = "ask") -> int:
     print()
-    log("Setup installs Kismet/capture helpers, adds your user to kismet and "
-        "dialout, and sets capture capabilities.", "hdr")
+    log("Setup installs Kismet/capture helpers, Ubertooth tools and udev rules, "
+        "adds your user to kismet/dialout/plugdev, and sets capture capabilities.", "hdr")
     if not is_root():
         log(
             f"Re-run as root so packages and groups can be changed: "
@@ -1233,6 +1980,7 @@ def run_setup(download_ieee: str = "ask") -> int:
     ok = install_packages()
     ensure_groups(username)
     ensure_capture_caps()
+    ensure_ubertooth_setup()
     unblock_radios()
     cleanup_monitor_vaps()
     ensure_ieee_oui_database(download_ieee)
@@ -1440,6 +2188,101 @@ def kismet_bt_list() -> list[tuple[str, str]]:
     return found
 
 
+def kismet_ubertooth_list() -> list[tuple[str, str]]:
+    helper = shutil.which("kismet_cap_ubertooth_one")
+    if not helper:
+        return []
+    proc = run_cmd([helper, "--list"])
+    found: list[tuple[str, str]] = []
+    for line in (proc.stdout or "").splitlines():
+        match = re.match(r"\s+(\S+)\s+\(([^)]+)\)", line)
+        if match:
+            found.append((match.group(1), match.group(2)))
+    return found
+
+
+def iter_usb_vid_pid() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    root = Path("/sys/bus/usb/devices")
+    if not root.is_dir():
+        return rows
+    for node in root.iterdir():
+        vid = read_sysfs(node / "idVendor").lower()
+        pid = read_sysfs(node / "idProduct").lower()
+        if not vid or not pid:
+            continue
+        bus = read_sysfs(node / "busnum")
+        dev = read_sysfs(node / "devnum")
+        devnode = ""
+        if bus.isdigit() and dev.isdigit():
+            devnode = f"/dev/bus/usb/{int(bus):03d}/{int(dev):03d}"
+        rows.append(
+            {
+                "sys": str(node),
+                "vendor": vid,
+                "product": pid,
+                "manufacturer": read_sysfs(node / "manufacturer"),
+                "name": read_sysfs(node / "product"),
+                "serial": read_sysfs(node / "serial"),
+                "bus": bus,
+                "dev": dev,
+                "devnode": devnode,
+            }
+        )
+    return rows
+
+
+def list_ubertooth_devices() -> list[dict[str, Any]]:
+    """Ubertooth One sniffers visible to Kismet and/or USB."""
+    items: list[dict[str, Any]] = []
+    usb_hits = [
+        u for u in iter_usb_vid_pid() if (u["vendor"], u["product"]) in UBERTOOTH_USB_IDS
+    ]
+    listed = kismet_ubertooth_list()
+    n = max(len(listed), len(usb_hits), 1 if usb_hits or listed else 0)
+    for idx in range(n):
+        iface, driver = listed[idx] if idx < len(listed) else (f"ubertooth-{idx}", "ubertooth")
+        usb = usb_hits[idx] if idx < len(usb_hits) else {}
+        dfu = usb.get("product") == "6003"
+        serial = usb.get("serial") or ""
+        writable = False
+        node = usb.get("devnode") or ""
+        if node and Path(node).exists():
+            writable = is_root() or os.access(node, os.W_OK)
+        hint = "Ubertooth One (DFU — re-plug or flash firmware)" if dfu else "Ubertooth One BTLE sniffer"
+        detail = [
+            f"usb={usb.get('vendor', '1d50')}:{usb.get('product', '6002')}  "
+            f"serial={serial or '-'}  "
+            f"{usb.get('manufacturer') or 'Great Scott Gadgets'}  "
+            f"{usb.get('name') or 'Ubertooth One'}",
+            "Passive BTLE sniffer on channel 37. Flute also enables Linux HCI "
+            "so devices still enumerate (Ubertooth packets often fail Kismet CRC).",
+        ]
+        if not writable and node:
+            detail.append(
+                f"{node} is not writable. Run: sudo python3 {Path(sys.argv[0]).name} --setup"
+            )
+        if dfu:
+            detail.append("Device is in DFU/ISP mode; unplug and re-insert before capturing.")
+        items.append(
+            {
+                "kind": "bluetooth",
+                "source_type": "ubertooth",
+                "iface": iface,
+                "mac": serial,
+                "name": usb.get("name") or "Ubertooth One",
+                "driver": driver or "ubertooth",
+                "label": f"{iface}  {hint}",
+                "detail": detail,
+                "recommended": (not dfu) and bool(shutil.which("kismet_cap_ubertooth_one")),
+                "rfkill": "n/a",
+                "usb_node": node,
+                "dfu": dfu,
+            }
+        )
+    return items
+
+
 def is_usb_net(iface: str) -> bool:
     try:
         resolved = str(Path(f"/sys/class/net/{iface}/device").resolve())
@@ -1520,7 +2363,7 @@ def list_wifi_controllers() -> list[dict[str, Any]]:
 
 def list_bt_controllers() -> list[dict[str, Any]]:
     cap = {iface: driver for iface, driver in kismet_bt_list()}
-    items: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = list_ubertooth_devices()
     proc = run_cmd(["bluetoothctl", "list"])
     listed: dict[str, str] = {}
     for line in (proc.stdout or "").splitlines():
@@ -1558,6 +2401,7 @@ def list_bt_controllers() -> list[dict[str, Any]]:
             items.append(
                 {
                     "kind": "bluetooth",
+                    "source_type": "linuxbluetooth",
                     "iface": iface,
                     "mac": "",
                     "name": "",
@@ -1568,6 +2412,13 @@ def list_bt_controllers() -> list[dict[str, Any]]:
                     "rfkill": rfkill_state("bluetooth", iface),
                 }
             )
+        items.sort(
+            key=lambda x: (
+                0 if x.get("source_type") == "ubertooth" and x.get("recommended") else 1,
+                0 if x.get("recommended") else 1,
+                str(x.get("iface") or ""),
+            )
+        )
         return items
 
     for iface in names:
@@ -1600,13 +2451,15 @@ def list_bt_controllers() -> list[dict[str, Any]]:
                 "name": name,
                 "driver": cap.get(iface, "linuxhci"),
                 "manuf": manuf,
+                "source_type": "linuxbluetooth",
                 "label": f"{iface}  {hint}" + (f"  ({name})" if name else ""),
                 "detail": [
                     f"bdaddr={mac or '-'}  manufacturer={manuf or usb_label or '-'}  "
                     f"usb={usb_vendor}:{usb_product if usb_product else '-'}  "
                     f"powered={powered}  rfkill={kill}",
+                    "Linux HCI inquiry/LE scan: names, not advertisement payloads.",
                 ],
-                "recommended": True,
+                "recommended": not any(x.get("source_type") == "ubertooth" and x.get("recommended") for x in items),
                 "rfkill": kill,
             }
         )
@@ -1615,6 +2468,7 @@ def list_bt_controllers() -> list[dict[str, Any]]:
             items.append(
                 {
                     "kind": "bluetooth",
+                    "source_type": "linuxbluetooth",
                     "iface": iface,
                     "mac": "",
                     "name": "",
@@ -1625,6 +2479,13 @@ def list_bt_controllers() -> list[dict[str, Any]]:
                     "rfkill": "unknown",
                 }
             )
+    items.sort(
+        key=lambda x: (
+            0 if x.get("source_type") == "ubertooth" and x.get("recommended") else 1,
+            0 if x.get("recommended") else 1,
+            str(x.get("iface") or ""),
+        )
+    )
     return items
 
 
@@ -2227,7 +3088,9 @@ def write_override_conf(
     test_name: str,
     operator: str,
     hop_rate: int,
+    log_packets: bool = False,
 ) -> None:
+    keep_packets = pcap or log_packets
     lines = [
         f"server_name={TOOL_ID}",
         f"server_description={sanitize_title(test_name)} / {sanitize_title(operator)}",
@@ -2240,7 +3103,7 @@ def write_override_conf(
         "kis_log_alerts=true",
         "kis_log_gps_track=true",
         "kis_log_system_status=true",
-        "kis_log_packets=" + ("true" if pcap else "false"),
+        "kis_log_packets=" + ("true" if keep_packets else "false"),
         "kis_log_data_packets=" + ("true" if pcap else "false"),
         "channel_hop=true",
         f"channel_hop_speed={hop_rate}/sec",
@@ -2490,8 +3353,19 @@ def extract_device_record(row: dict[str, Any], collector_macs: set[str]) -> dict
             devjson, ssid, str(bt_name) if bt_name else ""
         ),
         "bt_name": bt_name or "",
+        "btle_uuid_vendor": unique_join(
+            [
+                str(v)
+                for v in _walk_json_values(devjson, "btle.common.uuid_vendor")
+                if v
+            ]
+        ),
         "manufacturer": kg(devjson, "kismet.device.base.manuf", default=""),
         "ieee_manufacturer": "Unknown",
+        "mac_kind": "",
+        "bt_company": "",
+        "bt_uuids": "",
+        "scan_data": kg(bt if isinstance(bt, dict) else {}, "bluetooth.device.scan_data_bytes", default=""),
         "channel": kg(devjson, "kismet.device.base.channel", default=""),
         "frequency_khz": freq,
         "frequency_mhz": freq_mhz,
@@ -2534,6 +3408,43 @@ def extract_devices(db_path: Path, collector_macs: set[str]) -> list[dict[str, A
     conn.close()
     devices.sort(key=lambda d: (str(d.get("phy")), str(d.get("type")), str(d.get("mac"))))
     return devices
+
+
+def extract_bt_radio_stats(db_path: Path) -> dict[str, int]:
+    """Packet counts so an Ubertooth-only run is not mistaken for 'no BLE on the air'."""
+    import sqlite3
+
+    out = {"ubertooth_packets": 0, "btle_packets": 0, "unknown_dlt256_packets": 0}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return out
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT typestring, json FROM datasources")
+        for row in cur.fetchall():
+            if "ubertooth" not in str(row["typestring"] or "").lower():
+                continue
+            blob = load_device_json(row["json"])
+            try:
+                out["ubertooth_packets"] += int(
+                    blob.get("kismet.datasource.num_packets") or 0
+                )
+            except (TypeError, ValueError):
+                pass
+        cur.execute(
+            "SELECT phyname, dlt, COUNT(*) FROM packets GROUP BY phyname, dlt"
+        )
+        for phy, dlt, n in cur.fetchall():
+            if str(phy) == "BTLE":
+                out["btle_packets"] += int(n)
+            elif dlt == 256:
+                out["unknown_dlt256_packets"] += int(n)
+    except sqlite3.Error:
+        pass
+    conn.close()
+    return out
 
 
 def extract_gps_track(db_path: Path) -> list[dict[str, Any]]:
@@ -2601,6 +3512,9 @@ def csv_fields() -> list[str]:
         "bt_name",
         "manufacturer",
         "ieee_manufacturer",
+        "mac_kind",
+        "bt_company",
+        "bt_uuids",
         "channel",
         "frequency_mhz",
         "frequency_khz",
@@ -2643,6 +3557,7 @@ def summarize_devices(devices: list[dict[str, Any]]) -> dict[str, int]:
         "with_ssid": 0,
         "ieee_known": 0,
         "ieee_unknown": 0,
+        "ble_random": 0,
     }
     for rec in devices:
         phy = str(rec.get("phy") or "").lower()
@@ -2662,10 +3577,13 @@ def summarize_devices(devices: list[dict[str, Any]]) -> dict[str, int]:
             summary["with_gps"] += 1
         if rec.get("ssid"):
             summary["with_ssid"] += 1
-        if rec.get("ieee_manufacturer") and rec.get("ieee_manufacturer") != "Unknown":
+        vendor = rec.get("ieee_manufacturer") or "Unknown"
+        if vendor not in _UNMAPPED_VENDORS:
             summary["ieee_known"] += 1
         else:
             summary["ieee_unknown"] += 1
+        if str(rec.get("mac_kind") or "").startswith("ble-") and rec.get("mac_kind") != "ble-public":
+            summary["ble_random"] += 1
     return summary
 
 
@@ -2721,12 +3639,19 @@ def write_reports(outdir: Path, payload: dict[str, Any]) -> None:
         f"Devices observed: {summary.get('total', 0)}",
         f"  Wi-Fi: {summary.get('wifi', 0)}  (AP-like {summary.get('wifi_ap', 0)}, "
         f"client/probe {summary.get('wifi_client', 0)})",
-        f"  Bluetooth: {summary.get('bluetooth', 0)}",
+        f"  Bluetooth: {summary.get('bluetooth', 0)}"
+        + (
+            f"  (Ubertooth packets {summary.get('ubertooth_packets', 0)}, "
+            f"BTLE-decoded {summary.get('btle_packets', 0)})"
+            if summary.get("ubertooth_packets")
+            else ""
+        ),
         f"  With SSID: {summary.get('with_ssid', 0)}",
         f"  With advertised name: {summary.get('named', 0)}",
         f"  With GPS: {summary.get('with_gps', 0)}",
-        f"  IEEE vendor known: {summary.get('ieee_known', 0)}  "
-        f"unknown: {summary.get('ieee_unknown', 0)}",
+        f"  IEEE/name vendor known: {summary.get('ieee_known', 0)}  "
+        f"unknown/random: {summary.get('ieee_unknown', 0)}  "
+        f"random BLE MACs: {summary.get('ble_random', 0)}",
         f"GPS track points: {len(track)}",
         "",
         "=== Devices ===",
@@ -2753,10 +3678,18 @@ def write_reports(outdir: Path, payload: dict[str, Any]) -> None:
             "mode (receive-only channel hop) and, if selected, the Linux Bluetooth "
             "HCI datasource. A USB NMEA GPS was attached when available so each "
             "device could be tagged with the surveyor's coordinates. After capture "
-            "stopped, each MAC was matched against the IEEE OUI / MA-M / MA-S "
-            "vendor registry (ieee_manufacturer; Unknown if unassigned). No packet "
-            "injection, deauthentication, association, or credential attacks "
-            "were enabled.",
+            "stopped, each MAC was matched against the IEEE OUI / MA-M / MA-S / IAB "
+            "registry and Bluetooth SIG company IDs. A BlueZ management tap "
+            "kept BLE advertisement payloads that Kismet's HCI helper otherwise "
+            "drops (Apple Continuity, Samsung/Motorola/Microsoft company IDs, "
+            "Google Fast Pair UUIDs). An Ubertooth One, if used, sniffs BTLE "
+            "on advertising channel 37; Kismet discards those frames when CRC "
+            "fails (common with the 50-byte Ubertooth truncate and host/firmware "
+            "API skew), so Linux HCI is enabled alongside it to enumerate "
+            "devices. BLE privacy/random addresses cannot be "
+            "mapped by MAC prefix; ieee_manufacturer is Random BLE address "
+            "when those extra fields are absent. No packet injection, "
+            "deauthentication, association, or credential attacks were enabled.",
             "Compare observed MACs / SSIDs / names against the authorized device "
             "inventory and the physical boundary approved for this test.",
         ]
@@ -2785,11 +3718,14 @@ def write_reports(outdir: Path, payload: dict[str, Any]) -> None:
         f"| Devices | {summary.get('total', 0)} |",
         f"| Wi-Fi | {summary.get('wifi', 0)} |",
         f"| Bluetooth | {summary.get('bluetooth', 0)} |",
+        f"| Ubertooth packets | {summary.get('ubertooth_packets', 0)} |",
+        f"| BTLE-decoded packets | {summary.get('btle_packets', 0)} |",
         f"| With SSID | {summary.get('with_ssid', 0)} |",
         f"| With name | {summary.get('named', 0)} |",
         f"| With GPS | {summary.get('with_gps', 0)} |",
-        f"| IEEE vendor known | {summary.get('ieee_known', 0)} |",
-        f"| IEEE vendor unknown | {summary.get('ieee_unknown', 0)} |",
+        f"| IEEE/name vendor known | {summary.get('ieee_known', 0)} |",
+        f"| Unknown or random BLE | {summary.get('ieee_unknown', 0)} |",
+        f"| Random BLE MACs | {summary.get('ble_random', 0)} |",
         f"| GPS track points | {len(track)} |",
         "",
         "## Devices",
@@ -2913,6 +3849,59 @@ def capture_loop(
         log("Stop requested.", "warn")
 
 
+def reprocess_outdir(outdir: Path, ieee_policy: str) -> int:
+    """Rebuild CSV/JSON/MD/TXT reports from an existing capture directory."""
+    outdir = outdir.expanduser().resolve()
+    if not outdir.is_dir():
+        log(f"Not a directory: {outdir}", "err")
+        return 1
+    ensure_ieee_oui_database(ieee_policy)
+    db_path = find_kismet_db(outdir)
+    if db_path is None:
+        log(f"No .kismet database in {outdir}", "err")
+        return 1
+    session: dict[str, Any] = {}
+    session_path = outdir / "operator_session.json"
+    if session_path.is_file():
+        try:
+            session = json.loads(session_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            session = {}
+    collector = {
+        str(session.get("wifi_mac") or "").upper(),
+        str(session.get("bluetooth_mac") or "").upper(),
+    }
+    collector.discard("")
+    log(f"Reprocessing {db_path}")
+    devices = extract_devices(db_path, collector)
+    apply_ieee_manufacturers(
+        devices,
+        load_ieee_oui_table(),
+        load_bt_company_table(),
+        collect_advertisements(outdir, db_path),
+    )
+    track = extract_gps_track(db_path)
+    summary = summarize_devices(devices)
+    summary.update(extract_bt_radio_stats(db_path))
+    payload = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "kismet_version": session.get("kismet_version") or "",
+        "kismet_db": str(db_path),
+        "session": session,
+        "summary": summary,
+        "devices": devices,
+        "gps_track": track,
+    }
+    write_reports(outdir, payload)
+    log(
+        f"Rewrote reports in {outdir}: {summary.get('total', 0)} device(s), "
+        f"{summary.get('ieee_known', 0)} vendor-known, "
+        f"{summary.get('ble_random', 0)} random BLE MAC(s).",
+        "ok",
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -2924,7 +3913,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--setup",
         action="store_true",
-        help="Install Kismet/helpers, add user to kismet+dialout, set capabilities (needs sudo)",
+        help="Install Kismet/helpers, Ubertooth tools+udev, groups, capabilities (needs sudo)",
     )
     p.add_argument(
         "--check",
@@ -2935,12 +3924,12 @@ def build_parser() -> argparse.ArgumentParser:
     ieee.add_argument(
         "--download-ieee",
         action="store_true",
-        help="Download/refresh the IEEE MAC vendor database without asking (needs internet)",
+        help="Download/refresh IEEE MAC prefixes and Bluetooth SIG company IDs without asking",
     )
     ieee.add_argument(
         "--no-download-ieee",
         action="store_true",
-        help="Never download the IEEE MAC vendor database (offline / air-gapped)",
+        help="Never download vendor databases (offline / air-gapped)",
     )
     p.add_argument("--i-have-roe", action="store_true", help="Confirm signed ROE / authorization")
     p.add_argument(
@@ -2955,8 +3944,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Test / location name, e.g. 'Warehouse 4 north wing'",
     )
     p.add_argument("--wifi", default="", help="Wi-Fi interface to use (skip picker)")
-    p.add_argument("--bluetooth", default="", help="Bluetooth HCI to use (skip picker)")
+    p.add_argument(
+        "--bluetooth",
+        default="",
+        help="Bluetooth source (hci0, ubertooth-0). Skip picker",
+    )
     p.add_argument("--no-bluetooth", action="store_true", help="Do not enable a Bluetooth source")
+    p.add_argument(
+        "--no-hci",
+        action="store_true",
+        help="When using Ubertooth, do not also enable Linux HCI (device list will likely be empty)",
+    )
     p.add_argument("--gps-device", default="", help="GPS serial device (default: autodetect)")
     p.add_argument("--gps-baud", type=int, default=0, help="GPS baud (default: autodetect or 4800)")
     p.add_argument("--no-gps", action="store_true", help="Do not attach a GPS")
@@ -2976,6 +3974,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hide-data", action="store_true", help="Truncate 802.11 data payloads in Kismet")
     p.add_argument("--list-only", action="store_true", help="List controllers and GPS, then exit")
     p.add_argument("--dry-run", action="store_true", help="Show the Kismet command and exit")
+    p.add_argument(
+        "--report-from",
+        default="",
+        metavar="DIR",
+        help=(
+            "Rebuild reports from an existing capture directory (reads the .kismet "
+            "log; does not start a new survey). Re-applies IEEE / BT SIG / name lookups."
+        ),
+    )
     return p
 
 
@@ -2996,6 +4003,8 @@ def main() -> int:
     if args.list_only:
         print_hardware(list_wifi_controllers(), list_bt_controllers(), list_gps_devices())
         return 0
+    if args.report_from:
+        return reprocess_outdir(Path(args.report_from), ieee_policy)
 
     confirm_roe(args.i_have_roe)
     blockers = prepare_system()
@@ -3117,9 +4126,60 @@ def main() -> int:
         f"hop=true,hoprate={hop_rate}/sec"
     ]
     if bt:
-        sources.append(
-            f"{bt['iface']}:type=linuxbluetooth,name={sanitize_title(bt.get('label') or bt['iface'])}"
-        )
+        if bt.get("source_type") == "ubertooth" or str(bt.get("iface") or "").startswith(
+            "ubertooth"
+        ):
+            if bt.get("dfu"):
+                log(
+                    "Ubertooth is in DFU/ISP mode. Unplug and re-insert it, then retry.",
+                    "err",
+                )
+                return 1
+            sources.append(
+                f"{bt['iface']}:type=ubertooth,name={sanitize_title(bt.get('label') or bt['iface'])},"
+                "channel=37,hop=false"
+            )
+            log(
+                "Ubertooth stays on BTLE advertising channel 37 "
+                "(Kismet disables hopping; firmware can hang on 38/39).",
+                "ok",
+            )
+            util = shutil.which("ubertooth-util")
+            if util:
+                proc = run_cmd([util, "-v"], timeout=8)
+                ver = (proc.stdout or proc.stderr or "").strip().splitlines()
+                if ver:
+                    log("Ubertooth " + ver[0][:120])
+                    if "API:1.07" in ver[0] or "1.07" in ver[0]:
+                        log(
+                            "Host libubertooth is API 1.06. Kismet often cannot CRC-check "
+                            "Ubertooth packets, so they never become Bluetooth devices. "
+                            "Linux HCI is added as a companion enumerator unless --no-hci.",
+                            "warn",
+                        )
+            if not args.no_hci:
+                for item in bt_list:
+                    if item.get("source_type") == "linuxbluetooth":
+                        sources.append(
+                            f"{item['iface']}:type=linuxbluetooth,"
+                            f"name={sanitize_title(item.get('label') or item['iface'])}"
+                        )
+                        log(
+                            f"Also enabling {item['iface']} (Linux HCI) so BLE devices "
+                            "still appear in the report.",
+                            "ok",
+                        )
+            else:
+                log(
+                    "--no-hci: Ubertooth only. Expect few or no Bluetooth device rows "
+                    "(Kismet drops CRC-fail sniffer packets).",
+                    "warn",
+                )
+        else:
+            sources.append(
+                f"{bt['iface']}:type=linuxbluetooth,"
+                f"name={sanitize_title(bt.get('label') or bt['iface'])}"
+            )
     gps_line = ""
     gpsd_proc: subprocess.Popen[bytes] | None = None
     if gps:
@@ -3142,7 +4202,8 @@ def main() -> int:
     log(f"Operator   : {userid} / {operator_name}")
     log(f"Test       : {test_name}")
     log(f"Wi-Fi      : {wifi['iface']} ({wifi.get('hint')})  mac={wifi.get('mac')}")
-    log(f"Bluetooth  : {bt['iface'] if bt else '(disabled)'}")
+    bt_ifaces = [s.split(":", 1)[0] for s in sources[1:] if "type=ubertooth" in s or "type=linuxbluetooth" in s]
+    log(f"Bluetooth  : {', '.join(bt_ifaces) if bt_ifaces else '(disabled)'}")
     log(f"GPS        : {gps['device'] + ' @ ' + str(gps.get('baud')) + ' baud' if gps else '(disabled)'}")
     log(f"Hop rate   : {hop_rate}/sec ({hop_dwell_ms(hop_rate)} ms/channel)")
     log(f"Duration   : {args.duration or 'until Ctrl-C'}")
@@ -3175,6 +4236,13 @@ def main() -> int:
     password = secrets.token_urlsafe(16)
     write_httpd_conf(homedir, KISMET_HTTP_USER, password)
     override = outdir / "kismet_override.conf"
+    use_ubertooth = bool(
+        bt
+        and (
+            bt.get("source_type") == "ubertooth"
+            or str(bt.get("iface") or "").startswith("ubertooth")
+        )
+    )
     write_override_conf(
         override,
         gps_line=gps_line,
@@ -3184,6 +4252,7 @@ def main() -> int:
         test_name=test_name,
         operator=operator_name,
         hop_rate=hop_rate,
+        log_packets=use_ubertooth,
     )
 
     session = {
@@ -3202,7 +4271,7 @@ def main() -> int:
         "wifi_source": sources[0],
         "bluetooth_iface": bt["iface"] if bt else "",
         "bluetooth_mac": bt.get("mac") if bt else "",
-        "bluetooth_source": sources[1] if bt else "",
+        "bluetooth_source": " | ".join(sources[1:]) if bt else "",
         "gps": gps_line or "",
         "gps_device": gps["device"] if gps else "",
         "gps_mode": (gps or {}).get("mode") or "",
@@ -3222,7 +4291,31 @@ def main() -> int:
     kismet_log = outdir / "kismet_server.log"
     proc: subprocess.Popen[bytes] | None = None
     db_path: Path | None = None
+    ble_tap: BleEirTap | None = None
     try:
+        hci_src = next((s for s in sources if "type=linuxbluetooth" in s), "")
+        hci_match = re.search(r"hci(\d+)", hci_src, re.I)
+        if hci_match:
+            ble_tap = BleEirTap(
+                ble_adv_log_path(outdir),
+                int(hci_match.group(1)),
+            )
+            ble_tap.start()
+            time.sleep(0.2)
+            if ble_tap.error:
+                log(
+                    "BLE advertisement tap failed "
+                    f"({ble_tap.error}). Apple/Samsung/Motorola company IDs "
+                    "need this tap (run as root). Kismet HCI still records names.",
+                    "warn",
+                )
+                ble_tap = None
+            else:
+                log(
+                    "BLE advertisement tap on BlueZ management socket "
+                    "(company IDs / UUIDs that Kismet HCI drops).",
+                    "ok",
+                )
         proc = start_kismet(
             kismet_bin,
             homedir=homedir,
@@ -3254,6 +4347,9 @@ def main() -> int:
     finally:
         log("Stopping Kismet so the log can be finalized...")
         stop_kismet(proc)
+        if ble_tap is not None:
+            ble_tap.stop()
+            log(f"BLE advertisement tap: {ble_tap.seen} event(s) -> {ble_tap.path}")
         stop_gpsd(gpsd_proc)
         restore_wifi(wifi["iface"])
 
@@ -3271,9 +4367,22 @@ def main() -> int:
     collector.discard("")
 
     devices = extract_devices(db_path, collector)
-    apply_ieee_manufacturers(devices, load_ieee_oui_table())
+    apply_ieee_manufacturers(
+        devices,
+        load_ieee_oui_table(),
+        load_bt_company_table(),
+        collect_advertisements(outdir, db_path),
+    )
     track = extract_gps_track(db_path)
     summary = summarize_devices(devices)
+    summary.update(extract_bt_radio_stats(db_path))
+    if summary.get("ubertooth_packets") and not summary.get("bluetooth"):
+        log(
+            f"Ubertooth logged {summary['ubertooth_packets']} packet(s) but Kismet "
+            "created 0 Bluetooth devices (CRC/decode). Use HCI as well "
+            "(default unless --no-hci).",
+            "warn",
+        )
     session["generated_end"] = datetime.now(timezone.utc).isoformat()
     session["kismet_db"] = str(db_path)
     payload = {
