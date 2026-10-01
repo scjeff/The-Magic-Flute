@@ -271,15 +271,63 @@ Default directory: `flute_YYYYMMDDTHHMMSSZ/`
 | `flute_report.json`     | Full structured result                                                          |
 | `flute_report.txt`      | Human-readable report                                                           |
 | `flute_report.md`       | Markdown report                                                                 |
-| `flute_devices.csv`     | Every device (MAC, SSID, `ieee_manufacturer`, `mac_kind`, `bt_company`, `bt_uuids`, signal, frequency, GPS, names) |
+| `flute_devices.csv`     | Every device (MAC, SSID, `ieee_manufacturer`, `mac_kind`, `bt_company`, `bt_uuids`, signal, frequency, GPS, names, `closest_m`, `furthest_m`) |
 | `ble_advertisements.jsonl` | Raw BLE AD/EIR from the BlueZ tap (company IDs, UUIDs). Empty if the tap could not bind. |
-| `flute_wifi.csv`        | Wi-Fi subset                                                                    |
-| `flute_bluetooth.csv`   | Bluetooth subset                                                                |
+| `flute_wifi.csv`        | Wi-Fi subset (same columns, including `closest_m` and `furthest_m`)            |
+| `flute_bluetooth.csv`   | Bluetooth subset (same columns, including `closest_m` and `furthest_m`)        |
+| `flute_hop_log.csv`     | One row per device heard on each channel hop. Appended and synced during the capture so a crash keeps completed hops. |
 | `flute_gps_track.csv`   | Surveyor track (when a fix existed)                                             |
 | `*.kismet`              | Native Kismet database                                                          |
 | `kismet_server.log`     | Kismet stdout                                                                   |
 
 Do not commit capture output. Indoor GPS can take minutes or fail; the script keeps collecting and leaves coordinates empty until there is a fix.
+
+## Hop log
+
+`flute_hop_log.csv` is opened when Kismet comes up and **appended on every channel hop**. Each append is flushed and `fsync`'d, so a crash, `SIGTERM`, or Ctrl-C keeps every hop that finished. The summary CSVs and the text report are still written at the end of a clean stop.
+
+The file is a normal CSV. One hop that hears three devices adds three rows. Those rows share the same `hop` number and the same `timestamp` (UTC, from this computer's clock, millisecond resolution). A device is written when its packet count, last signal, strongest or weakest signal, or last-heard time changed. Devices that were not heard again are not repeated.
+
+| Column | Meaning |
+| --- | --- |
+| `hop` | Sample number since capture start (one sample per channel dwell) |
+| `timestamp` | UTC time of that sample |
+| `mac` | Device MAC heard on that hop |
+| `phy`, `type`, `ssid`, `channel` | What Kismet had for the device |
+| `frequency_mhz` | Frequency used for the distance estimate |
+| `signal_dbm` | Signal on that hop, dBm. Blank when Kismet has no dBm sample (it reports `0`) |
+| `distance_m` | Rough range in meters. Blank when `signal_dbm` is blank |
+| `tx_dbm` | Transmit power used in the formula. The AP's advertised power when it sends one, otherwise the assumed power below |
+| `path_loss_exponent` | `2.7` for every row |
+
+Kismet's last-heard clock is one-second resolution. Packet count and signal update sooner, so a device that sends during a dwell is logged on that hop. A radio that stays quiet is not logged again.
+
+`--report-from` rebuilds `closest_m` and `furthest_m` from the Kismet database. It cannot rebuild `flute_hop_log.csv`. That history only exists if it was written during the capture.
+
+## Distance estimate
+
+Signal level and distance are **not** linear. Received power in milliwatts falls off roughly with the square of distance in open air, which is a straight line only when you plot dBm against the logarithm of distance. The estimate uses the log-distance path loss model:
+
+```
+RSSI = TX - FSPL(1 m) - 10 * n * log10(d)
+d    = 10 ^ ((TX - FSPL(1 m) - RSSI) / (10 * n))
+FSPL(1 m) = 20 * log10(f_MHz) - 27.55
+```
+
+`n` is the path loss exponent. `n = 2` is free space (the inverse-square law). Indoors, with walls and bodies, `n` is usually somewhere from 2.7 to 4. Every distance in this tool uses **`n = 2.7`**, a rough middle for a walking survey. It is not a calibrated range.
+
+Assumed transmit power, used only when the device does not advertise one:
+
+| Radio | Assumed TX |
+| --- | ---: |
+| Wi-Fi AP, or any non-client beaconing an SSID | 20 dBm |
+| Other Wi-Fi | 15 dBm |
+| Bluetooth classic (BR/EDR, Class 2) | 4 dBm |
+| BLE | 0 dBm |
+
+`closest_m` on the device CSVs is this formula applied to the **strongest** signal (`signal_max_dbm`). `furthest_m` uses the **weakest** (`signal_min_dbm`). They sit next to `first_seen` and `last_seen`: first/last are the time extremes, closest/furthest are the distance extremes. The text and Markdown reports are otherwise unchanged.
+
+A 10 dB error (ordinary multipath, or a phone that is not actually transmitting at the assumed power) scales the distance by about 2.3× at `n = 2.7`. Read `distance_m` as near / mid / far, not as a tape measure. Moving the antenna a few centimeters can change the reading.
 
 ## Troubleshooting
 

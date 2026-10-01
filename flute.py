@@ -38,6 +38,7 @@ import io
 import grp
 import http.cookiejar
 import json
+import math
 import os
 import pwd
 import re
@@ -197,6 +198,56 @@ BT_SIG_COMPANY_URL = (
 )
 IEEE_DB_MAX_AGE_DAYS = 180
 HTTP_USER_AGENT = "The-Magic-Flute/1.0 (passive wireless survey; GPL-3.0-or-later)"
+HOP_LOG_NAME = "flute_hop_log.csv"
+# Log-distance path loss. n=2 is free space (power falls as 1/r^2).
+# Indoor and body-shadowed paths are usually 2.7–4. 2.7 is the rough
+# mixed indoor/outdoor exponent used for every distance in this tool.
+PATH_LOSS_EXPONENT = 2.7
+# Used only when the transmitter does not advertise its power.
+WIFI_AP_TX_DBM = 20.0
+WIFI_CLIENT_TX_DBM = 15.0
+BT_CLASSIC_TX_DBM = 4.0  # Class 2, the common BR/EDR handheld class
+BLE_TX_DBM = 0.0
+HOP_LOG_FIELDS = [
+    "hop",
+    "timestamp",
+    "mac",
+    "phy",
+    "type",
+    "ssid",
+    "channel",
+    "frequency_mhz",
+    "signal_dbm",
+    "distance_m",
+    "tx_dbm",
+    "path_loss_exponent",
+]
+# Flat field list for the live device poll. Aliases keep each hop's HTTP
+# payload small. The SSID paths are dropped automatically if this Kismet
+# build rejects them.
+LIVE_DEVICE_FIELDS = [
+    ["kismet.device.base.macaddr", "mac"],
+    ["kismet.device.base.phyname", "phy"],
+    ["kismet.device.base.type", "type"],
+    ["kismet.device.base.channel", "channel"],
+    ["kismet.device.base.frequency", "frequency"],
+    ["kismet.device.base.last_time", "last_time"],
+    ["kismet.device.base.packets.total", "packets"],
+    ["kismet.device.base.signal/kismet.common.signal.last_signal", "signal"],
+    ["kismet.device.base.signal/kismet.common.signal.min_signal", "signal_min"],
+    ["kismet.device.base.signal/kismet.common.signal.max_signal", "signal_max"],
+    [
+        "dot11.device/dot11.device.last_beaconed_ssid_record/dot11.advertisedssid.ssid",
+        "ssid",
+    ],
+    [
+        "dot11.device/dot11.device.last_beaconed_ssid_record/dot11.advertisedssid.advertised_txpower",
+        "tx_power",
+    ],
+]
+LIVE_DEVICE_FIELDS_BASIC = [
+    item for item in LIVE_DEVICE_FIELDS if not str(item[0]).startswith("dot11.")
+]
 NAME_VENDOR_HINTS = (
     (re.compile(r"govee", re.I), "Govee"),
     (re.compile(r"\[lg\]|webos|\blg\b.*tv", re.I), "LG Electronics"),
@@ -386,6 +437,133 @@ def fmt_coord(lat: Any, lon: Any) -> str:
     if not valid_coord(lat, lon):
         return ""
     return f"{float(lat):.6f},{float(lon):.6f}"
+
+
+def fspl_1m_db(freq_mhz: float) -> float:
+    """Free-space loss at 1 meter. FSPL(dB) = 20*log10(f_MHz) - 27.55."""
+    return 20.0 * math.log10(freq_mhz) - 27.55
+
+
+def estimate_distance_m(
+    signal_dbm: Any,
+    freq_mhz: Any,
+    tx_dbm: float,
+    exponent: float = PATH_LOSS_EXPONENT,
+) -> float | None:
+    """Rough range in meters from a received signal level.
+
+    Log-distance path loss (the standard model; dBm falls with log10 of
+    distance, not in a straight line):
+
+        RSSI = TX - FSPL(1 m) - 10 * n * log10(d)
+        d = 10 ** ((TX - FSPL(1 m) - RSSI) / (10 * n))
+
+    n = 2 is free space. This tool uses n = 2.7 unless a caller overrides
+    it. Multipath and a wrong TX power move the result by a small factor,
+    so treat it as a near/far estimate.
+    """
+    try:
+        rssi = float(signal_dbm)
+        freq = float(freq_mhz)
+        tx = float(tx_dbm)
+        path_n = float(exponent)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (rssi, freq, tx, path_n)):
+        return None
+    # Kismet's frequency field is kHz. A caller may pass either.
+    if freq > 10000.0:
+        freq = freq / 1000.0
+    # Kismet stores 0 when it has no dBm sample. A positive value is not a
+    # plausible receive level for these radios.
+    if rssi >= 0.0 or rssi < -120.0 or freq < 100.0 or freq > 10000.0 or path_n <= 0.0:
+        return None
+    distance = 10 ** ((tx - fspl_1m_db(freq) - rssi) / (10.0 * path_n))
+    if not math.isfinite(distance) or distance <= 0.0:
+        return None
+    return distance
+
+
+def format_distance(meters: float | None) -> str:
+    if meters is None:
+        return ""
+    return f"{meters:.2f}"
+
+
+def format_dbm(value: Any) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(num) or num >= 0.0 or num < -120.0:
+        return ""
+    if num == int(num):
+        return str(int(num))
+    return f"{num:.1f}"
+
+
+def frequency_mhz_for_range(freq_raw: Any, channel: Any, phy: str) -> float | None:
+    """Return MHz. Kismet's frequency field is kHz."""
+    try:
+        freq = float(freq_raw)
+    except (TypeError, ValueError):
+        freq = 0.0
+    if freq > 10000.0:
+        freq = freq / 1000.0
+    if 100.0 <= freq <= 10000.0:
+        return freq
+    phy_l = (phy or "").lower()
+    if "blue" in phy_l:
+        return 2402.0
+    try:
+        ch_text = str(channel or "").strip().split()[0]
+        ch = int(float(re.sub(r"[^0-9.\-]", "", ch_text) or "nan"))
+    except (TypeError, ValueError, IndexError):
+        ch = 0
+    if 1 <= ch <= 13:
+        return 2412.0 + (ch - 1) * 5.0
+    if ch == 14:
+        return 2484.0
+    if 32 <= ch <= 196:
+        return 5000.0 + ch * 5.0
+    if "802" in phy_l or "wifi" in phy_l or "dot11" in phy_l or "ieee" in phy_l or not phy_l:
+        return 2437.0
+    return None
+
+
+def assumed_tx_dbm(phy: str, dtype: str, ssid: str = "") -> float:
+    text = f"{phy} {dtype}".lower()
+    if "br/edr" in text or "classic" in text:
+        return BT_CLASSIC_TX_DBM
+    if "btle" in text or "bluetooth" in text or "blue" in text:
+        return BLE_TX_DBM
+    if "ap" in text or "infrastructure" in text or "advertis" in text:
+        return WIFI_AP_TX_DBM
+    if ssid and "client" not in text:
+        return WIFI_AP_TX_DBM
+    return WIFI_CLIENT_TX_DBM
+
+
+def resolve_tx_dbm(phy: str, dtype: str, ssid: str = "", advertised_tx: Any = None) -> float:
+    """Prefer an advertised AP power when it is a plausible dBm value."""
+    try:
+        advertised = float(advertised_tx)
+    except (TypeError, ValueError):
+        advertised = 0.0
+    if math.isfinite(advertised) and 1.0 <= advertised <= 30.0:
+        return advertised
+    return assumed_tx_dbm(phy, dtype, ssid)
+
+
+def order_distance_pair(closest: str, furthest: str) -> tuple[str, str]:
+    try:
+        near = float(closest)
+        far = float(furthest)
+    except (TypeError, ValueError):
+        return closest, furthest
+    if near > far:
+        return furthest, closest
+    return closest, furthest
 
 
 def print_banner() -> None:
@@ -2956,6 +3134,46 @@ class KismetClient:
             return {}
         return json.loads(raw)
 
+    def post_json(self, path: str, payload: dict[str, Any], timeout: float = 4) -> Any:
+        token = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+        raw_json = json.dumps(payload).encode()
+        bodies = (
+            (raw_json, "application/json"),
+            (
+                urllib.parse.urlencode({"json": raw_json.decode()}).encode(),
+                "application/x-www-form-urlencoded",
+            ),
+        )
+        errors: list[str] = []
+        for body, content_type in bodies:
+            req = urllib.request.Request(
+                self.base + path,
+                data=body,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": content_type,
+                    "Authorization": f"Basic {token}",
+                },
+                method="POST",
+            )
+            try:
+                with self.opener.open(req, timeout=timeout) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                if not text.strip():
+                    return []
+                return json.loads(text)
+            except urllib.error.HTTPError as exc:
+                errors.append(f"{content_type}: HTTP {exc.code}")
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+                if exc.code not in {400, 404, 405, 415, 500}:
+                    raise
+            except (TimeoutError, OSError, json.JSONDecodeError):
+                raise
+        raise urllib.error.URLError("Kismet POST failed: " + "; ".join(errors))
+
 
 def wait_for_kismet(
     client: KismetClient,
@@ -3381,6 +3599,22 @@ def extract_device_record(row: dict[str, Any], collector_macs: set[str]) -> dict
         "collector_radio": "yes" if mac in collector_macs else "no",
         **loc,
     }
+    adv_tx = ""
+    if isinstance(dot11, dict):
+        last_beacon = kg(dot11, "dot11.device.last_beaconed_ssid_record", default={}) or {}
+        if isinstance(last_beacon, dict):
+            adv_tx = kg(last_beacon, "dot11.advertisedssid.advertised_txpower", default="")
+    tx = resolve_tx_dbm(str(phy), str(dtype), ssid, adv_tx)
+    range_mhz = freq_mhz
+    if not range_mhz:
+        fallback = frequency_mhz_for_range(freq, rec.get("channel"), str(phy))
+        range_mhz = f"{fallback:.3f}" if fallback else ""
+    strong = rec["signal_max_dbm"]
+    if strong in ("", None):
+        strong = rec["signal_last_dbm"]
+    closest = format_distance(estimate_distance_m(strong, range_mhz, tx))
+    furthest = format_distance(estimate_distance_m(rec["signal_min_dbm"], range_mhz, tx))
+    rec["closest_m"], rec["furthest_m"] = order_distance_pair(closest, furthest)
     return rec
 
 
@@ -3524,6 +3758,8 @@ def csv_fields() -> list[str]:
         "encryption",
         "first_seen",
         "last_seen",
+        "closest_m",
+        "furthest_m",
         "packets",
         "gps_lat",
         "gps_lon",
@@ -3770,6 +4006,9 @@ def write_reports(outdir: Path, payload: dict[str, Any]) -> None:
     log(f"All devices : {csv_all}", "ok")
     log(f"Wi-Fi CSV   : {csv_wifi}", "ok")
     log(f"Bluetooth   : {csv_bt}", "ok")
+    hop_log_path = outdir / HOP_LOG_NAME
+    if hop_log_path.is_file():
+        log(f"Hop log     : {hop_log_path}", "ok")
     if track:
         log(f"GPS track   : {csv_gps}", "ok")
 
@@ -3810,43 +4049,296 @@ def match_named(items: list[dict[str, Any]], name: str, key: str) -> dict[str, A
     return None
 
 
+def _plain_field(value: Any) -> str:
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return str(value).strip()
+
+
+def _plain_ssid(value: Any) -> str:
+    """SSIDs are strings. Kismet returns numeric 0 when a device has none."""
+    if value is None or isinstance(value, (dict, list, bool, int, float)):
+        return ""
+    return str(value).strip()
+
+
+def normalize_live_device(dev: dict[str, Any]) -> dict[str, Any]:
+    """Accept either a field-simplified device or a full Kismet device object."""
+
+    def pick(alias: str, *path: str) -> Any:
+        if alias in dev and not isinstance(dev[alias], (dict, list)):
+            return dev[alias]
+        return kg(dev, *path, default="")
+
+    ssid = _plain_ssid(pick("ssid"))
+    if not ssid:
+        ssid = _plain_ssid(
+            kg(
+                dev,
+                "dot11.device",
+                "dot11.device.last_beaconed_ssid_record",
+                "dot11.advertisedssid.ssid",
+                default="",
+            )
+        )
+    tx_power = pick("tx_power")
+    if tx_power in ("", None):
+        tx_power = kg(
+            dev,
+            "dot11.device",
+            "dot11.device.last_beaconed_ssid_record",
+            "dot11.advertisedssid.advertised_txpower",
+            default="",
+        )
+    signal = pick(
+        "signal",
+        "kismet.device.base.signal",
+        "kismet.common.signal.last_signal",
+    )
+    return {
+        "mac": _plain_field(pick("mac", "kismet.device.base.macaddr")).upper(),
+        "phy": _plain_field(pick("phy", "kismet.device.base.phyname")),
+        "type": _plain_field(pick("type", "kismet.device.base.type")),
+        "channel": _plain_field(pick("channel", "kismet.device.base.channel")),
+        "frequency": pick("frequency", "kismet.device.base.frequency"),
+        "last_time": pick("last_time", "kismet.device.base.last_time"),
+        "packets": pick("packets", "kismet.device.base.packets.total"),
+        "signal": signal,
+        "signal_min": pick(
+            "signal_min",
+            "kismet.device.base.signal",
+            "kismet.common.signal.min_signal",
+        ),
+        "signal_max": pick(
+            "signal_max",
+            "kismet.device.base.signal",
+            "kismet.common.signal.max_signal",
+        ),
+        "ssid": ssid,
+        "tx_power": tx_power,
+    }
+
+
+_live_device_fields = LIVE_DEVICE_FIELDS
+
+
+def fetch_recent_devices(client: KismetClient, since_unix: int) -> list[dict[str, Any]]:
+    """Devices Kismet has heard since since_unix (absolute epoch seconds)."""
+    global _live_device_fields
+    path = f"/devices/last-time/{max(int(since_unix), 0)}/devices.json"
+
+    def _pull(fields: list[Any]) -> Any:
+        return client.post_json(path, {"fields": fields}, timeout=2.5)
+
+    try:
+        data = _pull(_live_device_fields)
+    except urllib.error.URLError as exc:
+        # Field simplification errors come back as HTTP 4xx/5xx. A timeout
+        # or a refused connection does not, and must not drop the SSID fields.
+        field_error = isinstance(exc, urllib.error.HTTPError) or "POST failed" in str(exc)
+        if field_error and _live_device_fields is not LIVE_DEVICE_FIELDS_BASIC:
+            _live_device_fields = LIVE_DEVICE_FIELDS_BASIC
+            log(
+                "Kismet rejected the SSID fields on the hop poll. "
+                "Continuing with MAC, signal, and channel only.",
+                "warn",
+            )
+            data = _pull(_live_device_fields)
+        else:
+            raise
+    if isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, list):
+                data = value
+                break
+    if not isinstance(data, list):
+        return []
+    devices: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_live_device(item)
+        if not normalized["mac"] and not getattr(fetch_recent_devices, "warned_shape", False):
+            fetch_recent_devices.warned_shape = True  # type: ignore[attr-defined]
+            log(
+                "Hop poll returned a device with no MAC. "
+                f"Keys: {', '.join(list(item)[:12])}",
+                "warn",
+            )
+        devices.append(normalized)
+    return devices
+
+
+class HopLog:
+    """CSV appended once per channel hop and fsynced so a crash keeps it.
+
+    One sample is taken per channel dwell. Every device whose packet count,
+    signal, or last-heard time changed on that sample gets its own row.
+    Rows from the same sample share one timestamp and one hop number.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.hop = 0
+        self.rows = 0
+        self._seen: dict[str, tuple[Any, Any, Any]] = {}
+        self._last_error_log = 0.0
+        self._fh = path.open("a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._fh, fieldnames=HOP_LOG_FIELDS, extrasaction="ignore"
+        )
+        if path.stat().st_size == 0:
+            self._writer.writeheader()
+            self._commit()
+
+    def _commit(self) -> None:
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        if self._fh.closed:
+            return
+        try:
+            self._commit()
+        finally:
+            self._fh.close()
+
+    def note_error(self, exc: Exception) -> None:
+        now = time.time()
+        if now - self._last_error_log < 10:
+            return
+        self._last_error_log = now
+        log(
+            f"Hop log sample failed ({exc}). Capture continues; "
+            "rows already synced are still on disk.",
+            "warn",
+        )
+
+    def append_sample(self, devices: list[dict[str, Any]]) -> int:
+        self.hop += 1
+        stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        wrote = 0
+        for dev in devices:
+            mac = str(dev.get("mac") or "").upper()
+            if not mac:
+                continue
+            signature = (
+                dev.get("last_time"),
+                dev.get("packets"),
+                dev.get("signal"),
+                dev.get("signal_min"),
+                dev.get("signal_max"),
+            )
+            if self._seen.get(mac) == signature:
+                continue
+            self._seen[mac] = signature
+            phy = str(dev.get("phy") or "")
+            dtype = str(dev.get("type") or "")
+            ssid = str(dev.get("ssid") or "")
+            freq = frequency_mhz_for_range(dev.get("frequency"), dev.get("channel"), phy)
+            tx = resolve_tx_dbm(phy, dtype, ssid, dev.get("tx_power"))
+            signal_text = format_dbm(dev.get("signal"))
+            distance = ""
+            if signal_text:
+                distance = format_distance(
+                    estimate_distance_m(signal_text, freq, tx)
+                )
+            self._writer.writerow(
+                {
+                    "hop": self.hop,
+                    "timestamp": stamp,
+                    "mac": mac,
+                    "phy": phy,
+                    "type": dtype,
+                    "ssid": ssid,
+                    "channel": dev.get("channel") or "",
+                    "frequency_mhz": f"{freq:.3f}" if freq else "",
+                    "signal_dbm": signal_text,
+                    "distance_m": distance,
+                    "tx_dbm": f"{tx:.1f}",
+                    "path_loss_exponent": f"{PATH_LOSS_EXPONENT:.1f}",
+                }
+            )
+            wrote += 1
+        if wrote:
+            self._commit()
+            self.rows += wrote
+        return wrote
+
+
+def _raise_keyboard_interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
 def capture_loop(
     client: KismetClient,
     proc: subprocess.Popen[bytes],
     duration: int | None,
+    hop_log: HopLog | None = None,
+    hop_rate: int = DEFAULT_HOP_RATE,
 ) -> None:
     started = time.time()
+    interval = 1.0 / max(int(hop_rate), 1)
+    next_status = 0.0
+    next_hop = time.monotonic()
+    # Overlap the "seen since" query by a few seconds. Kismet's last-heard
+    # time is whole seconds, and a strict cutoff drops a packet that lands
+    # on the boundary. Unchanged devices are not written twice.
+    since_ts = int(started) - 4
     log("Capture running. Press Ctrl-C to stop." + (f" Duration={duration}s." if duration else ""))
     log("Kismet web UI: http://127.0.0.1:2501 (local only)")
+    if hop_log is not None:
+        log(
+            f"Hop log appends one row per device heard on each channel hop "
+            f"({hop_rate}/sec) and syncs it to disk."
+        )
+    old_term = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
         while True:
             if proc.poll() is not None:
                 log(f"Kismet exited early with code {proc.returncode}.", "err")
                 return
-            elapsed = int(time.time() - started)
+            now = time.time()
+            elapsed = int(now - started)
             if duration is not None and elapsed >= duration:
                 log("Duration reached; stopping capture.", "ok")
                 return
-            info = live_counts(client)
-            gps = info.get("gps") or {}
-            if gps.get("valid"):
-                gps_s = f"{gps['lat']:.6f},{gps['lon']:.6f} fix={gps.get('fix') or '3D'}"
-            elif gps.get("sats"):
-                gps_s = f"searching ({gps['sats']} sats; window/sky)"
-            elif gps.get("connected"):
-                gps_s = "receiver up, 0 sats (place puck by a window; wait 1–5 min)"
-            else:
-                gps_s = "not connected"
-            phys = info.get("phys") or {}
-            phy_s = ", ".join(f"{k}={v}" for k, v in phys.items()) or f"total={info.get('devices')}"
-            remain = ""
-            if duration is not None:
-                remain = f"  remaining={max(duration - elapsed, 0)}s"
-            log(f"t={elapsed}s  GPS {gps_s}  devices {phy_s}{remain}")
-            time.sleep(5)
+            if hop_log is not None and time.monotonic() >= next_hop:
+                try:
+                    heard = fetch_recent_devices(client, since_ts)
+                    hop_log.append_sample(heard)
+                    since_ts = int(time.time()) - 4
+                except Exception as exc:
+                    hop_log.note_error(exc)
+                    since_ts = int(time.time()) - 4
+                next_hop = time.monotonic() + interval
+            if now >= next_status:
+                info = live_counts(client)
+                gps = info.get("gps") or {}
+                if gps.get("valid"):
+                    gps_s = f"{gps['lat']:.6f},{gps['lon']:.6f} fix={gps.get('fix') or '3D'}"
+                elif gps.get("sats"):
+                    gps_s = f"searching ({gps['sats']} sats; window/sky)"
+                elif gps.get("connected"):
+                    gps_s = "receiver up, 0 sats (place puck by a window; wait 1–5 min)"
+                else:
+                    gps_s = "not connected"
+                phys = info.get("phys") or {}
+                phy_s = ", ".join(f"{k}={v}" for k, v in phys.items()) or f"total={info.get('devices')}"
+                remain = ""
+                if duration is not None:
+                    remain = f"  remaining={max(duration - elapsed, 0)}s"
+                hop_s = ""
+                if hop_log is not None:
+                    hop_s = f"  hop={hop_log.hop} logged={hop_log.rows}"
+                log(f"t={elapsed}s  GPS {gps_s}  devices {phy_s}{hop_s}{remain}")
+                next_status = now + 5
+            time.sleep(min(0.05, interval / 2))
     except KeyboardInterrupt:
         print()
         log("Stop requested.", "warn")
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
 
 
 def reprocess_outdir(outdir: Path, ieee_policy: str) -> int:
@@ -4208,6 +4700,7 @@ def main() -> int:
     log(f"Hop rate   : {hop_rate}/sec ({hop_dwell_ms(hop_rate)} ms/channel)")
     log(f"Duration   : {args.duration or 'until Ctrl-C'}")
     log(f"Output     : {outdir}")
+    log(f"Hop log    : {outdir / HOP_LOG_NAME} (CSV, one row per device per hop, synced each hop)")
     log("Passive    : no injection, deauth, association, or pairing")
 
     if args.dry_run:
@@ -4278,6 +4771,9 @@ def main() -> int:
         "http_port": http_port,
         "hop_rate_per_sec": hop_rate,
         "hop_dwell_ms": hop_dwell_ms(hop_rate),
+        "hop_log": HOP_LOG_NAME,
+        "distance_model": "log-distance",
+        "path_loss_exponent": PATH_LOSS_EXPONENT,
         "passive": True,
         "injection": False,
         "kismet_version": version,
@@ -4292,6 +4788,7 @@ def main() -> int:
     proc: subprocess.Popen[bytes] | None = None
     db_path: Path | None = None
     ble_tap: BleEirTap | None = None
+    hop_log: HopLog | None = None
     try:
         hci_src = next((s for s in sources if "type=linuxbluetooth" in s), "")
         hci_match = re.search(r"hci(\d+)", hci_src, re.I)
@@ -4343,8 +4840,18 @@ def main() -> int:
                 time.sleep(args.duration)
         else:
             log(f"Kismet is up (pid {proc.pid}). Web UI http://127.0.0.1:{http_port}", "ok")
-            capture_loop(client, proc, args.duration or None)
+            hop_log = HopLog(outdir / HOP_LOG_NAME)
+            log(f"Hop log synced each hop: {hop_log.path}", "ok")
+            capture_loop(
+                client,
+                proc,
+                args.duration or None,
+                hop_log=hop_log,
+                hop_rate=hop_rate,
+            )
     finally:
+        if hop_log is not None:
+            hop_log.close()
         log("Stopping Kismet so the log can be finalized...")
         stop_kismet(proc)
         if ble_tap is not None:
