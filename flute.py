@@ -4170,11 +4170,17 @@ def fetch_recent_devices(client: KismetClient, since_unix: int) -> list[dict[str
 
 
 class HopLog:
-    """CSV appended once per channel hop and fsynced so a crash keeps it.
+    """CSV of devices that changed, fsynced so a crash keeps completed samples.
 
-    One sample is taken per channel dwell. Every device whose packet count,
-    signal, or last-heard time changed on that sample gets its own row.
-    Rows from the same sample share one timestamp and one hop number.
+    `hop` counts every poll, starting at 1. The poll is scheduled once per
+    channel dwell (the hop rate). It is this script's sample number, not
+    Kismet's channel index. A poll that sees no change writes no rows and
+    is not synced, so the hop column skips: 2, 4, 9 means samples 1, 3,
+    and 5–8 had nothing new. A row is written when a MAC's packet count,
+    last signal, strongest or weakest signal, or last-heard time differs
+    from the last row stored for that MAC. The first time a MAC is seen,
+    that counts as a change. Rows from the same poll share one timestamp
+    and one hop number.
     """
 
     def __init__(self, path: Path) -> None:
@@ -4215,6 +4221,7 @@ class HopLog:
         )
 
     def append_sample(self, devices: list[dict[str, Any]]) -> int:
+        # Always advance. Quiet polls stay out of the file, so hop numbers gap.
         self.hop += 1
         stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         wrote = 0
@@ -4222,6 +4229,9 @@ class HopLog:
             mac = str(dev.get("mac") or "").upper()
             if not mac:
                 continue
+            # Unchanged across these five fields means "not heard again".
+            # Kismet's last_time ticks in whole seconds, so a steady
+            # transmitter is often logged about once a second.
             signature = (
                 dev.get("last_time"),
                 dev.get("packets"),
@@ -4289,8 +4299,9 @@ def capture_loop(
     log("Kismet web UI: http://127.0.0.1:2501 (local only)")
     if hop_log is not None:
         log(
-            f"Hop log appends one row per device heard on each channel hop "
-            f"({hop_rate}/sec) and syncs it to disk."
+            f"Hop log records a device when its packets, signal, or "
+            f"last-heard time change ({hop_rate} samples/sec) and syncs "
+            f"those rows. Quiet samples increment hop and add no rows."
         )
     old_term = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
@@ -4700,7 +4711,10 @@ def main() -> int:
     log(f"Hop rate   : {hop_rate}/sec ({hop_dwell_ms(hop_rate)} ms/channel)")
     log(f"Duration   : {args.duration or 'until Ctrl-C'}")
     log(f"Output     : {outdir}")
-    log(f"Hop log    : {outdir / HOP_LOG_NAME} (CSV, one row per device per hop, synced each hop)")
+    log(
+        f"Hop log    : {outdir / HOP_LOG_NAME} "
+        "(changed devices only; hop numbers skip quiet samples)"
+    )
     log("Passive    : no injection, deauth, association, or pairing")
 
     if args.dry_run:

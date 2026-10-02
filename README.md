@@ -275,7 +275,7 @@ Default directory: `flute_YYYYMMDDTHHMMSSZ/`
 | `ble_advertisements.jsonl` | Raw BLE AD/EIR from the BlueZ tap (company IDs, UUIDs). Empty if the tap could not bind. |
 | `flute_wifi.csv`        | Wi-Fi subset (same columns, including `closest_m` and `furthest_m`)            |
 | `flute_bluetooth.csv`   | Bluetooth subset (same columns, including `closest_m` and `furthest_m`)        |
-| `flute_hop_log.csv`     | One row per device heard on each channel hop. Appended and synced during the capture so a crash keeps completed hops. |
+| `flute_hop_log.csv`     | Devices whose packets, signal, or last-heard time changed on a sample. The `hop` column skips samples with no change. Appended and synced during the capture so a crash keeps completed samples. |
 | `flute_gps_track.csv`   | Surveyor track (when a fix existed)                                             |
 | `*.kismet`              | Native Kismet database                                                          |
 | `kismet_server.log`     | Kismet stdout                                                                   |
@@ -284,23 +284,33 @@ Do not commit capture output. Indoor GPS can take minutes or fail; the script ke
 
 ## Hop log
 
-`flute_hop_log.csv` is opened when Kismet comes up and **appended on every channel hop**. Each append is flushed and `fsync`'d, so a crash, `SIGTERM`, or Ctrl-C keeps every hop that finished. The summary CSVs and the text report are still written at the end of a clean stop.
+`flute_hop_log.csv` is opened when Kismet comes up. The script polls Kismet once per channel dwell (the hop rate, default 5/sec, so a poll is scheduled every 200 ms). Each poll increments a sample counter named `hop`, whether or not anything is written. `hop` is that counter. It is not a row number, not a Wi-Fi channel, and not a counter read back from Kismet.
 
-The file is a normal CSV. One hop that hears three devices adds three rows. Those rows share the same `hop` number and the same `timestamp` (UTC, from this computer's clock, millisecond resolution). A device is written when its packet count, last signal, strongest or weakest signal, or last-heard time changed. Devices that were not heard again are not repeated.
+A poll writes rows only for devices that changed, then flushes and `fsync`s those rows. A crash, `SIGTERM`, or Ctrl-C keeps every sample that wrote rows. A poll with nothing new writes nothing and does not sync. The summary CSVs and the text report are still written at the end of a clean stop.
+
+Because quiet polls are omitted, the numbers in the file skip. A `hop` column that reads `2, 4, 9, 20, 38` is the normal result:
+
+- Sample 1 ran and Kismet had not returned a device yet, so the file starts at 2.
+- Samples 3, 5–8, and 10–19 ran. Every MAC already in the log still had the same packet count, signal, and last-heard time, so those samples added no rows.
+- Samples 2, 4, 9, 20, and 38 each had at least one new or changed device.
+
+Several devices that change on the same poll share that `hop` number and the same `timestamp` (UTC, from this computer's clock, millisecond resolution). Three devices changing on sample 20 produce three rows, all with `hop` 20.
+
+A device is written when its packet count, last signal, strongest or weakest signal, or last-heard time differs from the last row stored for that MAC. The first time a MAC is seen, that counts as a change. A radio that stays quiet, or that keeps beaconing with the same signal and the same packet count, is not repeated on later polls.
+
+Kismet's last-heard clock is one-second resolution. A steady transmitter is often logged about once a second, when that clock ticks, rather than on every 200 ms poll. A change of 1 dB in the signal logs it on the poll that saw the change. Asking Kismet over HTTP takes longer than the dwell on a busy host, so the real poll rate is often a little under the requested hop rate. That stretches the clock time between sample numbers. It does not drop sample numbers; the gaps in the file are the quiet polls.
 
 | Column | Meaning |
 | --- | --- |
-| `hop` | Sample number since capture start (one sample per channel dwell) |
-| `timestamp` | UTC time of that sample |
-| `mac` | Device MAC heard on that hop |
+| `hop` | Sample number since capture start, from 1. Increments on every poll, including polls that write no rows, so the values in the file skip |
+| `timestamp` | UTC time of that sample. Shared by every row written from the same poll |
+| `mac` | Device MAC that was new or had changed on that sample |
 | `phy`, `type`, `ssid`, `channel` | What Kismet had for the device |
 | `frequency_mhz` | Frequency used for the distance estimate |
-| `signal_dbm` | Signal on that hop, dBm. Blank when Kismet has no dBm sample (it reports `0`) |
+| `signal_dbm` | Signal on that sample, dBm. Blank when Kismet has no dBm sample (it reports `0`) |
 | `distance_m` | Rough range in meters. Blank when `signal_dbm` is blank |
 | `tx_dbm` | Transmit power used in the formula. The AP's advertised power when it sends one, otherwise the assumed power below |
 | `path_loss_exponent` | `2.7` for every row |
-
-Kismet's last-heard clock is one-second resolution. Packet count and signal update sooner, so a device that sends during a dwell is logged on that hop. A radio that stays quiet is not logged again.
 
 `--report-from` rebuilds `closest_m` and `furthest_m` from the Kismet database. It cannot rebuild `flute_hop_log.csv`. That history only exists if it was written during the capture.
 
