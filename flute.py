@@ -3606,9 +3606,20 @@ def extract_device_record(row: dict[str, Any], collector_macs: set[str]) -> dict
             adv_tx = kg(last_beacon, "dot11.advertisedssid.advertised_txpower", default="")
     tx = resolve_tx_dbm(str(phy), str(dtype), ssid, adv_tx)
     range_mhz = freq_mhz
-    if not range_mhz:
-        fallback = frequency_mhz_for_range(freq, rec.get("channel"), str(phy))
-        range_mhz = f"{fallback:.3f}" if fallback else ""
+    try:
+        range_ok = 100.0 <= float(freq_mhz) <= 10000.0
+    except (TypeError, ValueError):
+        range_ok = False
+    if not range_ok:
+        # Phy "unspecified" skips the 2437 MHz guess, so only a real
+        # channel number is written into the report.
+        from_channel = frequency_mhz_for_range(None, rec.get("channel"), "unspecified")
+        if from_channel:
+            range_mhz = f"{from_channel:.3f}"
+            rec["frequency_mhz"] = range_mhz
+        else:
+            fallback = frequency_mhz_for_range(freq, rec.get("channel"), str(phy))
+            range_mhz = f"{fallback:.3f}" if fallback else ""
     strong = rec["signal_max_dbm"]
     if strong in ("", None):
         strong = rec["signal_last_dbm"]
@@ -4068,6 +4079,9 @@ def normalize_live_device(dev: dict[str, Any]) -> dict[str, Any]:
     def pick(alias: str, *path: str) -> Any:
         if alias in dev and not isinstance(dev[alias], (dict, list)):
             return dev[alias]
+        # kg() with an empty path returns the whole device, not a field.
+        if not path:
+            return ""
         return kg(dev, *path, default="")
 
     ssid = _plain_ssid(pick("ssid"))
@@ -4081,15 +4095,14 @@ def normalize_live_device(dev: dict[str, Any]) -> dict[str, Any]:
                 default="",
             )
         )
-    tx_power = pick("tx_power")
-    if tx_power in ("", None):
-        tx_power = kg(
-            dev,
-            "dot11.device",
-            "dot11.device.last_beaconed_ssid_record",
-            "dot11.advertisedssid.advertised_txpower",
-            default="",
-        )
+    tx_power = pick(
+        "tx_power",
+        "dot11.device",
+        "dot11.device.last_beaconed_ssid_record",
+        "dot11.advertisedssid.advertised_txpower",
+    )
+    if isinstance(tx_power, (dict, list)):
+        tx_power = ""
     signal = pick(
         "signal",
         "kismet.device.base.signal",
