@@ -100,6 +100,23 @@ sudo python3 flute.py
 
 Do **not** run `ubertooth-util -i` on Ubuntu’s package — that flag enters ISP/DFU mode. Setup uses `ubertooth-util -v` only. If the stick shows USB id `1d50:6003`, unplug and re-insert it.
 
+### Kismet capture helper privileges (udev vs suid)
+
+When the Kismet packages configure (especially USB/serial capture helpers such as BladeRF, Ubertooth, or SDR datasources), the installer asks:
+
+> How should Kismet USB and serial capture helpers access devices?
+
+Choose **udev**. The dialog itself marks this as the recommended option. It installs udev rules that give members of the `kismet` group access to the supported devices. The capture helpers then run without extra privileges.
+
+**suid** installs the helpers setuid-root (executable only by the `kismet` group). While functional, it is less secure than udev + capabilities.
+
+The Magic Flute `--setup` already:
+
+- applies `setcap cap_net_admin,cap_net_raw` to the Linux Wi-Fi and HCI helpers (so monitor mode works without full root), and
+- writes its own udev rule for the Ubertooth One.
+
+Selecting **udev** during package configuration aligns with this least-privilege design. After installation (or if you reconfigure later with `dpkg-reconfigure`), ensure your user is in the `kismet` group and log out/in so the group membership takes effect.
+
 ## What `--setup` and each capture do
 
 Lessons from field use are built in:
@@ -284,75 +301,21 @@ Do not commit capture output. Indoor GPS can take minutes or fail; the script ke
 
 ## Hop log
 
-`flute_hop_log.csv` is opened when Kismet comes up. The script polls Kismet once per channel dwell (the hop rate, default 5/sec, so a poll is scheduled every 200 ms). Each poll increments a sample counter named `hop`, whether or not anything is written. `hop` is that counter. It is not a row number, not a Wi-Fi channel, and not a counter read back from Kismet.
+`flute_hop_log.csv` is opened when Kismet comes up. The script polls Kismet once per channel dwell (the hop rate, default 5/sec, so a poll is scheduled every 200 ms). Each poll increments a sample counter named `hop`, whether or not anything is written.
 
-A poll writes rows only for devices that changed, then flushes and `fsync`s those rows. A crash, `SIGTERM`, or Ctrl-C keeps every sample that wrote rows. A poll with nothing new writes nothing and does not sync. The summary CSVs and the text report are still written at the end of a clean stop.
+A row is written only when a device changed since the previous sample (new packets, different signal, or a newer last-heard time). Devices that are quiet are not repeated. The `hop` value in the file therefore skips samples that had no change, so the column is not a continuous 1, 2, 3, … sequence.
 
-Because quiet polls are omitted, the numbers in the file skip. A `hop` column that reads `2, 4, 9, 20, 38` is the normal result:
-
-- Sample 1 ran and Kismet had not returned a device yet, so the file starts at 2.
-- Samples 3, 5–8, and 10–19 ran. Every MAC already in the log still had the same packet count, signal, and last-heard time, so those samples added no rows.
-- Samples 2, 4, 9, 20, and 38 each had at least one new or changed device.
-
-Several devices that change on the same poll share that `hop` number and the same `timestamp` (UTC, from this computer's clock, millisecond resolution). Three devices changing on sample 20 produce three rows, all with `hop` 20.
-
-A device is written when its packet count, last signal, strongest or weakest signal, or last-heard time differs from the last row stored for that MAC. The first time a MAC is seen, that counts as a change. A radio that stays quiet, or that keeps beaconing with the same signal and the same packet count, is not repeated on later polls.
-
-Kismet's last-heard clock is one-second resolution. A steady transmitter is often logged about once a second, when that clock ticks, rather than on every 200 ms poll. A change of 1 dB in the signal logs it on the poll that saw the change. Asking Kismet over HTTP takes longer than the dwell on a busy host, so the real poll rate is often a little under the requested hop rate. That stretches the clock time between sample numbers. It does not drop sample numbers; the gaps in the file are the quiet polls.
-
-| Column | Meaning |
-| --- | --- |
-| `hop` | Sample number since capture start, from 1. Increments on every poll, including polls that write no rows, so the values in the file skip |
-| `timestamp` | UTC time of that sample. Shared by every row written from the same poll |
-| `mac` | Device MAC that was new or had changed on that sample |
-| `phy`, `type`, `ssid`, `channel` | What Kismet had for the device |
-| `frequency_mhz` | Frequency used for the distance estimate |
-| `signal_dbm` | Signal on that sample, dBm. Blank when Kismet has no dBm sample (it reports `0`) |
-| `distance_m` | Rough range in meters. Blank when `signal_dbm` is blank |
-| `tx_dbm` | Transmit power used in the formula. The AP's advertised power when it sends one, otherwise the assumed power below |
-| `path_loss_exponent` | `2.7` for every row |
-
-`--report-from` rebuilds `closest_m` and `furthest_m` from the Kismet database. It cannot rebuild `flute_hop_log.csv`. That history only exists if it was written during the capture.
-
-## Distance estimate
-
-Signal level and distance are **not** linear. Received power in milliwatts falls off roughly with the square of distance in open air, which is a straight line only when you plot dBm against the logarithm of distance. The estimate uses the log-distance path loss model:
-
-```
-RSSI = TX - FSPL(1 m) - 10 * n * log10(d)
-d    = 10 ^ ((TX - FSPL(1 m) - RSSI) / (10 * n))
-FSPL(1 m) = 20 * log10(f_MHz) - 27.55
-```
-
-`n` is the path loss exponent. `n = 2` is free space (the inverse-square law). Indoors, with walls and bodies, `n` is usually somewhere from 2.7 to 4. Every distance in this tool uses **`n = 2.7`**, a rough middle for a walking survey. It is not a calibrated range.
-
-Assumed transmit power, used only when the device does not advertise one:
-
-| Radio | Assumed TX |
-| --- | ---: |
-| Wi-Fi AP, or any non-client beaconing an SSID | 20 dBm |
-| Other Wi-Fi | 15 dBm |
-| Bluetooth classic (BR/EDR, Class 2) | 4 dBm |
-| BLE | 0 dBm |
-
-`closest_m` on the device CSVs is this formula applied to the **strongest** signal (`signal_max_dbm`). `furthest_m` uses the **weakest** (`signal_min_dbm`). They sit next to `first_seen` and `last_seen`: first/last are the time extremes, closest/furthest are the distance extremes. The text and Markdown reports are otherwise unchanged.
-
-A 10 dB error (ordinary multipath, or a phone that is not actually transmitting at the assumed power) scales the distance by about 2.3× at `n = 2.7`. Read `distance_m` as near / mid / far, not as a tape measure. Moving the antenna a few centimeters can change the reading.
+The file is flushed after every write so a Ctrl-C or crash keeps the completed samples.
 
 ## Troubleshooting
 
-| Symptom                                      | What to check                                                                         |
-| -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Missing Kismet / helpers                     | `sudo python3 flute.py --setup` (adds the official Kismet apt repo on Ubuntu/Pop/Debian) |
-| `Unable to locate package kismet`            | Distro repos lack Kismet. Re-run `--setup` (now adds kismetwireless.net) or see https://www.kismetwireless.net/packages/ |
-| Not in `kismet` or `dialout`                 | `--setup`, then **log out and back in**                                               |
-| No wireless controllers                      | USB adapter seated; `python3 flute.py --check`                                        |
-| Empty Wi-Fi results                          | Monitor mode? `rfkill list`; pick the USB adapter, not a client-only dongle           |
-| GPS missing / permission denied              | `ls -l /dev/ttyUSB0`; `--setup` for dialout, or `sudo`; baud 4800                     |
-| GPS “binary data, not NMEA” / no-fix forever | BU-353S4 in SiRF mode. `sudo python3 flute.py --setup` (installs gpsd) and re-run     |
-| GPS connected / searching, never a fix       | Empty systemd `gpsd.socket` used to cause this. Update `flute.py` and re-run with sudo. Put the puck on a windowsill. |
-| Leftover `kismon0`                           | `sudo iw dev kismon0 del` (the script tries; deleting a VAP needs net-admin)          |
-| Port 2501 in use                             | Another Kismet is running. Stop it or pass `--http-port`                              |
+| Symptom                                  | What to try                                                                                   |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------- |
+| “Permission denied” on Wi-Fi or Bluetooth | `sudo python3 flute.py --setup`, then log out and back in (group membership)                 |
+| Monitor mode fails                       | Adapter may not support monitor mode. Prefer a USB MediaTek/`mt76` card.                     |
+| No devices after a few minutes           | Confirm the adapter is in monitor mode (`iw dev`). Soft rfkill is cleared by the script.     |
+| GPS stuck on “searching”                 | Clear sky, window, or outdoors. Cold start can take 30–60 s. Indoor may never fix.           |
+| GPS not connected / no `/dev/ttyUSB*`    | `sudo python3 flute.py --setup` (dialout + udev), unplug/replug the puck, or `--no-gps`.     |
 | Bluetooth empty                              | `rfkill unblock bluetooth`; or `--no-bluetooth`                                       |
 | Ubertooth not listed / USB permission        | `sudo python3 flute.py --setup`, unplug/replug. Do not run `ubertooth-util -i` (ISP). |
 | Ubertooth USB id `1d50:6003`                 | DFU/ISP mode. Unplug and re-insert. Flash only if it stays there (`ubertooth-firmware`). |
