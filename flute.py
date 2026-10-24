@@ -38,6 +38,7 @@ import io
 import grp
 import http.cookiejar
 import json
+import math
 import os
 import pwd
 import re
@@ -113,6 +114,8 @@ DEB_KISMET_PACKAGES = [
     "kismet-capture-linux-wifi",
     "kismet-capture-linux-bluetooth",
     "kismet-capture-ubertooth-one",
+    # Kismet 2026-10 userspace USB Wi-Fi (mt76 / rtw88). Optional on older repos.
+    "kismet-capture-usbwifi",
 ]
 DEB_UBERTOOTH_PACKAGES = [
     "ubertooth",
@@ -197,6 +200,56 @@ BT_SIG_COMPANY_URL = (
 )
 IEEE_DB_MAX_AGE_DAYS = 180
 HTTP_USER_AGENT = "The-Magic-Flute/1.0 (passive wireless survey; GPL-3.0-or-later)"
+HOP_LOG_NAME = "flute_hop_log.csv"
+# Log-distance path loss. n=2 is free space (power falls as 1/r^2).
+# Indoor and body-shadowed paths are usually 2.7–4. 2.7 is the rough
+# mixed indoor/outdoor exponent used for every distance in this tool.
+PATH_LOSS_EXPONENT = 2.7
+# Used only when the transmitter does not advertise its power.
+WIFI_AP_TX_DBM = 20.0
+WIFI_CLIENT_TX_DBM = 15.0
+BT_CLASSIC_TX_DBM = 4.0  # Class 2, the common BR/EDR handheld class
+BLE_TX_DBM = 0.0
+HOP_LOG_FIELDS = [
+    "hop",
+    "timestamp",
+    "mac",
+    "phy",
+    "type",
+    "ssid",
+    "channel",
+    "frequency_mhz",
+    "signal_dbm",
+    "distance_m",
+    "tx_dbm",
+    "path_loss_exponent",
+]
+# Flat field list for the live device poll. Aliases keep each hop's HTTP
+# payload small. The SSID paths are dropped automatically if this Kismet
+# build rejects them.
+LIVE_DEVICE_FIELDS = [
+    ["kismet.device.base.macaddr", "mac"],
+    ["kismet.device.base.phyname", "phy"],
+    ["kismet.device.base.type", "type"],
+    ["kismet.device.base.channel", "channel"],
+    ["kismet.device.base.frequency", "frequency"],
+    ["kismet.device.base.last_time", "last_time"],
+    ["kismet.device.base.packets.total", "packets"],
+    ["kismet.device.base.signal/kismet.common.signal.last_signal", "signal"],
+    ["kismet.device.base.signal/kismet.common.signal.min_signal", "signal_min"],
+    ["kismet.device.base.signal/kismet.common.signal.max_signal", "signal_max"],
+    [
+        "dot11.device/dot11.device.last_beaconed_ssid_record/dot11.advertisedssid.ssid",
+        "ssid",
+    ],
+    [
+        "dot11.device/dot11.device.last_beaconed_ssid_record/dot11.advertisedssid.advertised_txpower",
+        "tx_power",
+    ],
+]
+LIVE_DEVICE_FIELDS_BASIC = [
+    item for item in LIVE_DEVICE_FIELDS if not str(item[0]).startswith("dot11.")
+]
 NAME_VENDOR_HINTS = (
     (re.compile(r"govee", re.I), "Govee"),
     (re.compile(r"\[lg\]|webos|\blg\b.*tv", re.I), "LG Electronics"),
@@ -386,6 +439,133 @@ def fmt_coord(lat: Any, lon: Any) -> str:
     if not valid_coord(lat, lon):
         return ""
     return f"{float(lat):.6f},{float(lon):.6f}"
+
+
+def fspl_1m_db(freq_mhz: float) -> float:
+    """Free-space loss at 1 meter. FSPL(dB) = 20*log10(f_MHz) - 27.55."""
+    return 20.0 * math.log10(freq_mhz) - 27.55
+
+
+def estimate_distance_m(
+    signal_dbm: Any,
+    freq_mhz: Any,
+    tx_dbm: float,
+    exponent: float = PATH_LOSS_EXPONENT,
+) -> float | None:
+    """Rough range in meters from a received signal level.
+
+    Log-distance path loss (the standard model; dBm falls with log10 of
+    distance, not in a straight line):
+
+        RSSI = TX - FSPL(1 m) - 10 * n * log10(d)
+        d = 10 ** ((TX - FSPL(1 m) - RSSI) / (10 * n))
+
+    n = 2 is free space. This tool uses n = 2.7 unless a caller overrides
+    it. Multipath and a wrong TX power move the result by a small factor,
+    so treat it as a near/far estimate.
+    """
+    try:
+        rssi = float(signal_dbm)
+        freq = float(freq_mhz)
+        tx = float(tx_dbm)
+        path_n = float(exponent)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (rssi, freq, tx, path_n)):
+        return None
+    # Kismet's frequency field is kHz. A caller may pass either.
+    if freq > 10000.0:
+        freq = freq / 1000.0
+    # Kismet stores 0 when it has no dBm sample. A positive value is not a
+    # plausible receive level for these radios.
+    if rssi >= 0.0 or rssi < -120.0 or freq < 100.0 or freq > 10000.0 or path_n <= 0.0:
+        return None
+    distance = 10 ** ((tx - fspl_1m_db(freq) - rssi) / (10.0 * path_n))
+    if not math.isfinite(distance) or distance <= 0.0:
+        return None
+    return distance
+
+
+def format_distance(meters: float | None) -> str:
+    if meters is None:
+        return ""
+    return f"{meters:.2f}"
+
+
+def format_dbm(value: Any) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(num) or num >= 0.0 or num < -120.0:
+        return ""
+    if num == int(num):
+        return str(int(num))
+    return f"{num:.1f}"
+
+
+def frequency_mhz_for_range(freq_raw: Any, channel: Any, phy: str) -> float | None:
+    """Return MHz. Kismet's frequency field is kHz."""
+    try:
+        freq = float(freq_raw)
+    except (TypeError, ValueError):
+        freq = 0.0
+    if freq > 10000.0:
+        freq = freq / 1000.0
+    if 100.0 <= freq <= 10000.0:
+        return freq
+    phy_l = (phy or "").lower()
+    if "blue" in phy_l:
+        return 2402.0
+    try:
+        ch_text = str(channel or "").strip().split()[0]
+        ch = int(float(re.sub(r"[^0-9.\-]", "", ch_text) or "nan"))
+    except (TypeError, ValueError, IndexError):
+        ch = 0
+    if 1 <= ch <= 13:
+        return 2412.0 + (ch - 1) * 5.0
+    if ch == 14:
+        return 2484.0
+    if 32 <= ch <= 196:
+        return 5000.0 + ch * 5.0
+    if "802" in phy_l or "wifi" in phy_l or "dot11" in phy_l or "ieee" in phy_l or not phy_l:
+        return 2437.0
+    return None
+
+
+def assumed_tx_dbm(phy: str, dtype: str, ssid: str = "") -> float:
+    text = f"{phy} {dtype}".lower()
+    if "br/edr" in text or "classic" in text:
+        return BT_CLASSIC_TX_DBM
+    if "btle" in text or "bluetooth" in text or "blue" in text:
+        return BLE_TX_DBM
+    if "ap" in text or "infrastructure" in text or "advertis" in text:
+        return WIFI_AP_TX_DBM
+    if ssid and "client" not in text:
+        return WIFI_AP_TX_DBM
+    return WIFI_CLIENT_TX_DBM
+
+
+def resolve_tx_dbm(phy: str, dtype: str, ssid: str = "", advertised_tx: Any = None) -> float:
+    """Prefer an advertised AP power when it is a plausible dBm value."""
+    try:
+        advertised = float(advertised_tx)
+    except (TypeError, ValueError):
+        advertised = 0.0
+    if math.isfinite(advertised) and 1.0 <= advertised <= 30.0:
+        return advertised
+    return assumed_tx_dbm(phy, dtype, ssid)
+
+
+def order_distance_pair(closest: str, furthest: str) -> tuple[str, str]:
+    try:
+        near = float(closest)
+        far = float(furthest)
+    except (TypeError, ValueError):
+        return closest, furthest
+    if near > far:
+        return furthest, closest
+    return closest, furthest
 
 
 def print_banner() -> None:
@@ -611,6 +791,53 @@ def binary_caps(path: str) -> str:
 def has_needed_caps(path: str) -> bool:
     caps = binary_caps(path).replace(" ", "")
     return "cap_net_admin" in caps and "cap_net_raw" in caps
+
+
+def is_setuid(path: str) -> bool:
+    try:
+        return bool(os.stat(path).st_mode & 0o4000)
+    except OSError:
+        return False
+
+
+def usbwifi_privilege_check() -> Check:
+    """Kismet 2026-10 kismet_cap_usbwifi detaches the kernel driver, so it is suid-root.
+
+    USB/serial sniffers (Ubertooth and the like) use udev instead. This check is
+    only about the userspace Wi-Fi helper.
+    """
+    path = shutil.which("kismet_cap_usbwifi")
+    if not path:
+        return Check(
+            "usbwifi",
+            True,
+            "kismet_cap_usbwifi not installed (kernel Wi-Fi source still works)",
+            critical=False,
+        )
+    if not os.access(path, os.X_OK):
+        return Check(
+            "usbwifi",
+            False,
+            f"{path} is not executable (join the kismet group and log in again)",
+            critical=False,
+            fixable=True,
+        )
+    if is_setuid(path) or is_root():
+        how = "setuid-root" if is_setuid(path) else "running as root"
+        return Check(
+            "usbwifi",
+            True,
+            f"{path} ({how}; can detach the kernel driver)",
+            critical=False,
+        )
+    return Check(
+        "usbwifi",
+        False,
+        f"{path} is not setuid. Kismet 2026-10 needs that (or root) to unbind a kernel Wi-Fi driver. "
+        "Re-run --setup, or dpkg-reconfigure kismet-capture-usbwifi with install-setuid true.",
+        critical=False,
+        fixable=True,
+    )
 
 
 @dataclass
@@ -1450,11 +1677,11 @@ def collect_checks() -> list[Check]:
             )
         )
 
-    hard = []
-    proc = run_cmd(["rfkill", "list"]) if shutil.which("rfkill") else None
-    if proc:
+    _rf_json, rf_text = rfkill_snapshot()
+    if shutil.which("rfkill"):
+        hard = []
         current = ""
-        for line in (proc.stdout or "").splitlines():
+        for line in rf_text.splitlines():
             if re.match(r"^\d+:", line):
                 current = line
             elif "Hard blocked: yes" in line:
@@ -1507,6 +1734,7 @@ def collect_checks() -> list[Check]:
             critical=False,
         )
     )
+    checks.append(usbwifi_privilege_check())
     uber_usb = [
         u for u in iter_usb_vid_pid() if (u["vendor"], u["product"]) in UBERTOOTH_USB_IDS
     ]
@@ -1538,7 +1766,7 @@ def collect_checks() -> list[Check]:
             Check("ubertooth", True, "none attached (optional BTLE sniffer)", critical=False)
         )
 
-    leftover = leftover_monitor_ifaces()
+    leftover = all_monitor_ifaces()
     checks.append(
         Check(
             "leftover-monitor",
@@ -1710,9 +1938,14 @@ def install_packages() -> bool:
     try:
         if manager == "apt":
             env = _apt_env()
+            # Kismet 2026-10 split this into two shared questions.
+            # install-setuid: Linux Wi-Fi, Bluetooth, and usbwifi (caps, or suid
+            # when the helper has no file capabilities).
+            # device-access: USB/serial sniffers. udev is the package default
+            # and matches the Ubertooth rule this script writes.
             for line in (
-                "kismet kismet/install-setuid boolean true\n",
-                "kismet-core kismet-core/install-setuid boolean true\n",
+                "kismet-common kismet-common/install-setuid boolean true\n",
+                "kismet-common kismet-common/device-access select udev\n",
             ):
                 run_cmd(["debconf-set-selections"], stdin=line, env=env)
             upd = run_cmd(["apt-get", "update"], timeout=300, env=env)
@@ -1855,6 +2088,18 @@ def ensure_ubertooth_setup() -> None:
         log("ubertooth tools not installed; udev is in place for the next capture.", "warn")
 
 
+def all_monitor_ifaces() -> list[str]:
+    """Every monitor netdev, including Kismet's wlan0mon / wlp0s20f3mon VAPs."""
+    found: list[str] = []
+    for row in parse_iw_dev():
+        name = str(row.get("iface") or "")
+        if not name:
+            continue
+        if name.startswith("kismon") or row.get("type") == "monitor":
+            found.append(name)
+    return found
+
+
 def leftover_monitor_ifaces(phy: str = "") -> list[str]:
     """kismon* always; other monitor VAPs only when they sit on phy."""
     if not shutil.which("iw"):
@@ -1885,11 +2130,13 @@ def cleanup_monitor_vaps(phy: str = "") -> None:
 
 
 def unblock_radios() -> None:
+    invalidate_hardware_cache()
     if not shutil.which("rfkill"):
         return
     run_cmd(["rfkill", "unblock", "wifi"])
     run_cmd(["rfkill", "unblock", "wlan"])
     run_cmd(["rfkill", "unblock", "bluetooth"])
+    invalidate_hardware_cache()
     log("Issued rfkill unblock for wifi and bluetooth.")
 
 
@@ -1911,11 +2158,11 @@ def prepare_system() -> list[str]:
     unblock_radios()
     cleanup_monitor_vaps()
 
-    proc = run_cmd(["rfkill", "list"]) if shutil.which("rfkill") else None
-    if proc:
+    if shutil.which("rfkill"):
+        _rf_json, rf_text = rfkill_snapshot()
         block = ""
         current = ""
-        for line in (proc.stdout or "").splitlines():
+        for line in rf_text.splitlines():
             if re.match(r"^\d+:", line):
                 current = line
             if "Hard blocked: yes" in line:
@@ -2044,47 +2291,74 @@ def net_mac(iface: str) -> str:
     return read_sysfs(Path(f"/sys/class/net/{iface}/address")).upper()
 
 
+_RFKILL_CACHE: dict[str, Any] | None = None
+_WIFI_LIST_CACHE: list[dict[str, Any]] | None = None
+_BT_LIST_CACHE: list[dict[str, Any]] | None = None
+
+
+def invalidate_hardware_cache() -> None:
+    """Drop cached rfkill and radio lists. Call after unblock or interface changes."""
+    global _RFKILL_CACHE, _WIFI_LIST_CACHE, _BT_LIST_CACHE
+    _RFKILL_CACHE = None
+    _WIFI_LIST_CACHE = None
+    _BT_LIST_CACHE = None
+
+
+def rfkill_snapshot() -> tuple[Any, str]:
+    """One rfkill -J and one rfkill list per cache lifetime."""
+    global _RFKILL_CACHE
+    if _RFKILL_CACHE is not None:
+        return _RFKILL_CACHE["json"], _RFKILL_CACHE["text"]
+    payload = None
+    text = ""
+    if shutil.which("rfkill"):
+        proc = run_cmd(["rfkill", "-J"])
+        raw = (proc.stdout or "").strip()
+        if proc.returncode == 0 and raw.startswith("{"):
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = None
+        text = run_cmd(["rfkill", "list"]).stdout or ""
+    _RFKILL_CACHE = {"json": payload, "text": text}
+    return payload, text
+
+
 def rfkill_state(kind: str, ident: str) -> str:
-    proc = run_cmd(["rfkill", "-J"])
-    if proc.returncode == 0 and proc.stdout.strip().startswith("{"):
-        try:
-            payload = json.loads(proc.stdout)
-            rows = payload.get("") or payload.get("rfkilldevices") or []
-            if isinstance(payload, dict) and not rows:
-                for value in payload.values():
-                    if isinstance(value, list):
-                        rows = value
-                        break
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                name = str(row.get("device") or row.get("name") or "")
-                rtype = str(row.get("type") or "")
-                if ident and ident not in name and ident != rtype:
-                    continue
-                if kind and rtype and kind not in rtype:
-                    continue
-                soft = str(row.get("soft") or "").lower()
-                hard = str(row.get("hard") or "").lower()
-                if hard in {"blocked", "1", "true"}:
-                    return "hard-blocked"
-                if soft in {"blocked", "1", "true"}:
-                    return "soft-blocked"
-                return "unblocked"
-        except json.JSONDecodeError:
-            pass
-    proc = run_cmd(["rfkill", "list"])
+    payload, text = rfkill_snapshot()
+    if isinstance(payload, dict):
+        rows = payload.get("") or payload.get("rfkilldevices") or []
+        if not rows:
+            for value in payload.values():
+                if isinstance(value, list):
+                    rows = value
+                    break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("device") or row.get("name") or "")
+            rtype = str(row.get("type") or "")
+            if ident and ident not in name and ident != rtype:
+                continue
+            if kind and rtype and kind not in rtype:
+                continue
+            soft = str(row.get("soft") or "").lower()
+            hard = str(row.get("hard") or "").lower()
+            if hard in {"blocked", "1", "true"}:
+                return "hard-blocked"
+            if soft in {"blocked", "1", "true"}:
+                return "soft-blocked"
+            return "unblocked"
     block = ""
     current = ""
-    for line in (proc.stdout or "").splitlines():
+    for line in text.splitlines():
         if re.match(r"^\d+:", line):
-            if current:
-                if ident.lower() in current.lower() or kind.lower() in current.lower():
-                    block = current
+            if current and (ident.lower() in current or kind.lower() in current):
+                block = current
             current = line.lower()
         else:
             current += " " + line.lower()
-    if ident.lower() in current.lower() or (kind.lower() in current.lower() and not block):
+    if ident.lower() in current or (kind.lower() in current and not block):
         block = current
     if "hard blocked: yes" in block:
         return "hard-blocked"
@@ -2144,6 +2418,13 @@ def parse_iw_dev() -> list[dict[str, Any]]:
         if phy_match:
             phy = f"phy{phy_match.group(1)}"
             continue
+        # phy-level block that is not a netdev (Intel P2P-device, unnamed).
+        # Its addr/type lines must not be applied to the previous interface.
+        if re.match(r"^\t\S", line) and not re.match(r"^\tInterface\s+", line):
+            if current:
+                ifaces.append(current)
+                current = None
+            continue
         if_match = re.search(r"Interface\s+(\S+)", line)
         if if_match:
             if current:
@@ -2153,9 +2434,12 @@ def parse_iw_dev() -> list[dict[str, Any]]:
                 "phy": phy,
                 "mac": "",
                 "type": "",
+                "ssid": "",
             }
             continue
         if current is None:
+            continue
+        if not line.startswith("\t\t"):
             continue
         addr = re.search(r"addr\s+([0-9a-fA-F:]{11,})", line)
         if addr:
@@ -2163,42 +2447,58 @@ def parse_iw_dev() -> list[dict[str, Any]]:
         typ = re.search(r"type\s+(\S+)", line)
         if typ:
             current["type"] = typ.group(1)
+        ssid = re.match(r"\t\tssid\s+(.+)$", line)
+        if ssid:
+            current["ssid"] = ssid.group(1).strip()
     if current:
         ifaces.append(current)
     return ifaces
 
 
-def kismet_wifi_list() -> list[tuple[str, str]]:
-    proc = run_cmd(["kismet_cap_linux_wifi", "--list"])
+def parse_kismet_cap_list(stdout: str) -> list[tuple[str, str]]:
+    """Parse `kismet_cap_* --list` rows: `    name (driver)` or `    name (driver (vid:pid))`."""
     found: list[tuple[str, str]] = []
-    for line in (proc.stdout or "").splitlines():
-        match = re.match(r"\s+(\S+)\s+\(([^)]+)\)", line)
+    for line in (stdout or "").splitlines():
+        match = re.match(r"\s+(\S+)\s+\((.+)\)\s*$", line)
         if match:
-            found.append((match.group(1), match.group(2)))
+            found.append((match.group(1), match.group(2).strip()))
     return found
+
+
+def kismet_helper_list(binary: str) -> list[tuple[str, str]]:
+    """Run `kismet_cap_* --list`. Some helpers print the table on stderr and exit 2."""
+    if not shutil.which(binary):
+        return []
+    if binary != "kismet_cap_linux_wifi" and not os.access(shutil.which(binary) or "", os.X_OK):
+        return []
+    proc = run_cmd([binary, "--list"])
+    return parse_kismet_cap_list(f"{proc.stdout or ''}\n{proc.stderr or ''}")
+
+
+def kismet_wifi_list() -> list[tuple[str, str]]:
+    return kismet_helper_list("kismet_cap_linux_wifi")
 
 
 def kismet_bt_list() -> list[tuple[str, str]]:
-    proc = run_cmd(["kismet_cap_linux_bluetooth", "--list"])
-    found: list[tuple[str, str]] = []
-    for line in (proc.stdout or "").splitlines():
-        match = re.match(r"\s+(\S+)\s+\(([^)]+)\)", line)
-        if match:
-            found.append((match.group(1), match.group(2)))
-    return found
+    return kismet_helper_list("kismet_cap_linux_bluetooth")
 
 
 def kismet_ubertooth_list() -> list[tuple[str, str]]:
-    helper = shutil.which("kismet_cap_ubertooth_one")
-    if not helper:
-        return []
-    proc = run_cmd([helper, "--list"])
-    found: list[tuple[str, str]] = []
-    for line in (proc.stdout or "").splitlines():
-        match = re.match(r"\s+(\S+)\s+\(([^)]+)\)", line)
-        if match:
-            found.append((match.group(1), match.group(2)))
-    return found
+    return kismet_helper_list("kismet_cap_ubertooth_one")
+
+
+def kismet_usbwifi_list() -> list[tuple[str, str]]:
+    """Kismet 2026-10 userspace USB Wi-Fi sources, e.g. `mt7921-0 (mt7921u (0e8d:7961))`."""
+    return kismet_helper_list("kismet_cap_usbwifi")
+
+
+def parse_usbwifi_desc(desc: str) -> tuple[str, str, str]:
+    """Return (driver, vid, pid) from `mt7921u (0e8d:7961)`. Missing ids are empty."""
+    match = re.match(r"(\S+)\s+\(([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\)", desc.strip())
+    if match:
+        return match.group(1), match.group(2).lower(), match.group(3).lower()
+    driver = desc.split()[0] if desc.strip() else "usbwifi"
+    return driver, "", ""
 
 
 def iter_usb_vid_pid() -> list[dict[str, str]]:
@@ -2303,13 +2603,18 @@ def classify_wifi(iface: str, driver: str, vendor: str, product: str) -> tuple[s
 
 
 def list_wifi_controllers() -> list[dict[str, Any]]:
+    global _WIFI_LIST_CACHE
+    if _WIFI_LIST_CACHE is not None:
+        return _WIFI_LIST_CACHE
     cap = {iface: driver for iface, driver in kismet_wifi_list()}
     seen: dict[str, dict[str, Any]] = {}
+    hidden_mon: set[str] = set()
     for row in parse_iw_dev():
         iface = row["iface"]
         if iface.startswith("lo") or iface.startswith("docker"):
             continue
         if iface.startswith("kismon") or row.get("type") == "monitor":
+            hidden_mon.add(iface)
             continue
         driver = cap.get(iface) or net_driver(iface)
         vendor, product = usb_ids_for_net(iface)
@@ -2319,7 +2624,9 @@ def list_wifi_controllers() -> list[dict[str, Any]]:
         usb = f"{vendor}:{product}" if vendor else ("usb" if is_usb_net(iface) else "pci/built-in")
         seen[iface] = {
             "kind": "wifi",
+            "source_type": "linuxwifi",
             "iface": iface,
+            "kernel_iface": iface,
             "phy": row.get("phy") or "",
             "mac": row.get("mac") or net_mac(iface),
             "driver": driver,
@@ -2333,35 +2640,116 @@ def list_wifi_controllers() -> list[dict[str, Any]]:
             "label": f"{iface}  {hint}",
             "detail": [
                 f"phy={row.get('phy') or '-'}  mac={row.get('mac') or net_mac(iface) or '-'}  "
-                f"driver={driver or '-'}  bus={usb}",
+                f"driver={driver or '-'}  bus={usb}  source=linuxwifi",
                 f"mode={row.get('type') or '-'}  monitor={'yes' if caps.get('monitor') else 'NO'}  "
                 f"bands={', '.join(caps.get('bands') or ['unknown'])}  rfkill={kill}",
             ],
         }
     for iface, driver in cap.items():
-        if iface not in seen:
-            seen[iface] = {
-                "kind": "wifi",
-                "iface": iface,
-                "phy": "",
-                "mac": net_mac(iface),
-                "driver": driver,
-                "type": "",
-                "usb": "",
-                "hint": driver,
-                "recommended": False,
-                "monitor": True,
-                "bands": [],
-                "rfkill": "unknown",
-                "label": f"{iface}  {driver}",
-                "detail": [f"Reported by kismet_cap_linux_wifi ({driver})"],
-            }
+        if iface in seen or iface in hidden_mon or iface.startswith("kismon"):
+            continue
+        seen[iface] = {
+            "kind": "wifi",
+            "source_type": "linuxwifi",
+            "iface": iface,
+            "kernel_iface": iface,
+            "phy": "",
+            "mac": net_mac(iface),
+            "driver": driver,
+            "type": "",
+            "usb": "",
+            "hint": driver,
+            "recommended": False,
+            "monitor": True,
+            "bands": [],
+            "rfkill": "unknown",
+            "label": f"{iface}  {driver}",
+            "detail": [f"Reported by kismet_cap_linux_wifi ({driver})"],
+        }
+    _attach_usbwifi_sources(seen)
     items = list(seen.values())
     items.sort(key=lambda x: (not x.get("recommended"), x["iface"]))
+    _WIFI_LIST_CACHE = items
     return items
 
 
+def _attach_usbwifi_sources(seen: dict[str, dict[str, Any]]) -> None:
+    """Add Kismet 2026-10 usbwifi sources and point them at the kernel iface they detach."""
+    by_usb: dict[tuple[str, str], list[str]] = {}
+    for iface, item in seen.items():
+        usb = str(item.get("usb") or "")
+        if ":" not in usb or usb.startswith("pci"):
+            continue
+        vid, pid = usb.split(":", 1)
+        by_usb.setdefault((vid.lower(), pid.lower()), []).append(iface)
+    used: set[str] = set()
+    for uiface, desc in kismet_usbwifi_list():
+        if uiface in seen:
+            continue
+        driver, vid, pid = parse_usbwifi_desc(desc)
+        kernel = ""
+        for candidate in by_usb.get((vid, pid), []):
+            if candidate not in used:
+                kernel = candidate
+                used.add(candidate)
+                break
+        kernel_item = seen.get(kernel) if kernel else None
+        hint, recommended = classify_wifi(uiface, driver, vid, pid)
+        if recommended:
+            hint = "Panda USB / MediaTek via usbwifi (preferred survey adapter)"
+        else:
+            hint = f"USB Wi-Fi via usbwifi ({driver})"
+        if kernel_item is not None:
+            kernel_item["recommended"] = False
+            kernel_hint = str(kernel_item.get("hint") or kernel)
+            kernel_hint = kernel_hint.replace(
+                "(preferred survey adapter)", "(kernel driver)"
+            )
+            if "kernel driver" not in kernel_hint:
+                kernel_hint = f"{kernel_hint} (kernel driver)"
+            kernel_item["hint"] = kernel_hint
+            kernel_item["label"] = f"{kernel}  {kernel_hint}"
+            kernel_item.setdefault("detail", []).append(
+                f"Also available as {uiface}:type=usbwifi (Kismet 2026-10). "
+                "The userspace source is preferred for monitor mode. "
+                "Do not capture on both at once."
+            )
+        bands = (kernel_item or {}).get("bands") or []
+        kill = (kernel_item or {}).get("rfkill") or "unknown"
+        mac = (kernel_item or {}).get("mac") or ""
+        usb = f"{vid}:{pid}" if vid else ""
+        detail = [
+            f"source=usbwifi  driver={driver or '-'}  usb={usb or '-'}  "
+            f"kernel={kernel or '-'}  mac={mac or '-'}",
+            "Kismet 2026-10 userspace driver. The kernel interface is detached "
+            "while this source is open and restored when the capture ends.",
+        ]
+        if bands:
+            detail.append(f"bands={', '.join(bands)}  rfkill={kill}")
+        seen[uiface] = {
+            "kind": "wifi",
+            "source_type": "usbwifi",
+            "iface": uiface,
+            "kernel_iface": kernel,
+            "phy": (kernel_item or {}).get("phy") or "",
+            "mac": mac,
+            "driver": driver,
+            "type": "usbwifi",
+            "usb": usb,
+            "hint": hint,
+            "recommended": True,
+            "monitor": True,
+            "bands": bands,
+            "rfkill": kill,
+            "label": f"{uiface}  {hint}",
+            "detail": detail,
+        }
+
+
 def list_bt_controllers() -> list[dict[str, Any]]:
+    global _BT_LIST_CACHE
+    if _BT_LIST_CACHE is not None:
+        return _BT_LIST_CACHE
     cap = {iface: driver for iface, driver in kismet_bt_list()}
     items: list[dict[str, Any]] = list_ubertooth_devices()
     proc = run_cmd(["bluetoothctl", "list"])
@@ -2419,6 +2807,7 @@ def list_bt_controllers() -> list[dict[str, Any]]:
                 str(x.get("iface") or ""),
             )
         )
+        _BT_LIST_CACHE = items
         return items
 
     for iface in names:
@@ -2426,17 +2815,18 @@ def list_bt_controllers() -> list[dict[str, Any]]:
         mac = info.get("mac") or ""
         name = info.get("name") or listed.get(mac, "")
         manuf = info.get("manuf") or ""
-        show = run_cmd(["bluetoothctl", "show", mac] if mac else ["bluetoothctl", "show"])
-        for line in (show.stdout or "").splitlines():
-            if "Manufacturer:" in line and not manuf:
-                manuf = line.split(":", 1)[-1].strip()
-            if line.strip().startswith("Name:") and not name:
-                name = line.split(":", 1)[-1].strip()
         kill = rfkill_state("bluetooth", iface)
         powered = info.get("powered") or "unknown"
         usb_vendor, usb_product, usb_label = usb_ids_from_sysfs(
             Path(f"/sys/class/bluetooth/{iface}/device")
         )
+        if not manuf or not name:
+            show = run_cmd(["bluetoothctl", "show", mac] if mac else ["bluetoothctl", "show"])
+            for line in (show.stdout or "").splitlines():
+                if "Manufacturer:" in line and not manuf:
+                    manuf = line.split(":", 1)[-1].strip()
+                if line.strip().startswith("Name:") and not name:
+                    name = line.split(":", 1)[-1].strip()
         intel = (
             "Intel" in manuf
             or manuf.startswith("0x0002")
@@ -2486,6 +2876,7 @@ def list_bt_controllers() -> list[dict[str, Any]]:
             str(x.get("iface") or ""),
         )
     )
+    _BT_LIST_CACHE = items
     return items
 
 
@@ -2894,6 +3285,46 @@ def nm_set_managed(iface: str, managed: bool) -> None:
             log(f"nmcli: {err}", "warn")
 
 
+def wifi_kernel_iface(wifi: dict[str, Any]) -> str:
+    """Netdev that NetworkManager owns. Empty when a usbwifi source has no kernel iface."""
+    if wifi.get("source_type") == "usbwifi":
+        return str(wifi.get("kernel_iface") or "")
+    return str(wifi.get("kernel_iface") or wifi.get("iface") or "")
+
+
+def wifi_source_definition(wifi: dict[str, Any], hop_rate: int) -> str:
+    name = sanitize_title(str(wifi.get("hint") or wifi.get("iface") or "wifi"))
+    iface = str(wifi["iface"])
+    hop = f"hop=true,hoprate={hop_rate}/sec"
+    if wifi.get("source_type") == "usbwifi":
+        return f"{iface}:type=usbwifi,name={name},{hop}"
+    return f"{iface}:name={name},{hop}"
+
+
+def default_route_iface() -> str:
+    """IPv4 default-route device with the lowest metric."""
+    proc = run_cmd(["ip", "-4", "route", "show", "default"])
+    best_dev = ""
+    best_metric = 10**9
+    for line in (proc.stdout or "").splitlines():
+        if not line.startswith("default "):
+            continue
+        parts = line.split()
+        dev = ""
+        metric = 0
+        if "dev" in parts:
+            dev = parts[parts.index("dev") + 1]
+        if "metric" in parts:
+            try:
+                metric = int(parts[parts.index("metric") + 1])
+            except ValueError:
+                metric = 0
+        if dev and metric < best_metric:
+            best_metric = metric
+            best_dev = dev
+    return best_dev
+
+
 def restore_wifi(iface: str) -> None:
     target_phy = ""
     for row in parse_iw_dev():
@@ -2904,6 +3335,154 @@ def restore_wifi(iface: str) -> None:
     run_cmd(["iw", "dev", iface, "set", "type", "managed"])
     run_cmd(["ip", "link", "set", iface, "up"])
     nm_set_managed(iface, True)
+    invalidate_hardware_cache()
+
+
+def usb_wifi_binds(vid: str, pid: str, fallback_driver: str = "") -> list[dict[str, str]]:
+    """Kernel driver attachments for a USB Wi-Fi device, recorded before usbwifi detaches them.
+
+    If the driver is already unbound, fallback_driver (from `kismet_cap_usbwifi --list`)
+    is used so a later rebind still knows which module to attach.
+    """
+    binds: list[dict[str, str]] = []
+    root = Path("/sys/bus/usb/devices")
+    if not vid or not pid or not root.is_dir():
+        return binds
+    for node in root.iterdir():
+        if read_sysfs(node / "idVendor").lower() != vid or read_sysfs(node / "idProduct").lower() != pid:
+            continue
+        for child in node.iterdir():
+            if ":" not in child.name or not child.is_dir():
+                continue
+            if not (child / "bInterfaceClass").exists():
+                continue
+            link = child / "driver"
+            driver = ""
+            if link.exists():
+                try:
+                    driver = link.resolve().name
+                except OSError:
+                    driver = ""
+            if driver in {"usb", "hub", "btusb"}:
+                continue
+            if not driver:
+                # Vendor-specific function (MediaTek Wi-Fi is 0xff). Do not guess
+                # onto a Bluetooth interface that usbwifi left alone.
+                if read_sysfs(child / "bInterfaceClass").lower() not in {"ff", "00"}:
+                    continue
+                if not fallback_driver:
+                    continue
+                driver = fallback_driver
+            binds.append({"sysfs": child.name, "driver": driver})
+    return binds
+
+
+def netdev_for_usb(vid: str, pid: str) -> str:
+    """Return a netdev whose USB device matches vid:pid, if the kernel has created one."""
+    if not vid or not pid:
+        return ""
+    root = Path("/sys/class/net")
+    if not root.is_dir():
+        return ""
+    for node in root.iterdir():
+        found_vid, found_pid = usb_ids_for_net(node.name)
+        if found_vid == vid.lower() and found_pid == pid.lower():
+            return node.name
+    return ""
+
+
+def rebind_usb_wifi(binds: list[dict[str, str]]) -> bool:
+    """Ask the kernel to bind a driver usbwifi left detached. Needs root."""
+    ok = True
+    for row in binds:
+        path = Path(f"/sys/bus/usb/drivers/{row['driver']}/bind")
+        try:
+            path.write_text(row["sysfs"] + "\n", encoding="utf-8")
+            log(f"Rebound {row['driver']} on {row['sysfs']}.", "ok")
+        except OSError as exc:
+            ok = False
+            log(
+                f"Could not rebind {row['driver']} on {row['sysfs']} ({exc}). "
+                "Run the capture as root, or unplug and replug the adapter.",
+                "warn",
+            )
+    return ok
+
+
+def reconnect_prior_ssid(wifi: dict[str, Any], iface: str) -> None:
+    """Bring a previously associated client interface back after monitor mode."""
+    ssid = str(wifi.get("prior_ssid") or "").strip()
+    if not ssid or not iface or not shutil.which("nmcli"):
+        return
+    proc = run_cmd(["nmcli", "device", "connect", iface], timeout=25)
+    if proc.returncode == 0:
+        log(f"Reconnected {iface} to {ssid}.", "ok")
+        return
+    err = (proc.stderr or proc.stdout or "").strip()
+    log(
+        f"Could not reconnect {iface} to {ssid}."
+        + (f" {err}" if err else "")
+        + " If a monitor interface is still up: sudo iw dev "
+        + f"{iface}mon del",
+        "warn",
+    )
+
+
+def _wait_netdev(name: str, seconds: float) -> bool:
+    if not name:
+        return False
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if Path(f"/sys/class/net/{name}").exists():
+            return True
+        time.sleep(0.25)
+    return bool(name) and Path(f"/sys/class/net/{name}").exists()
+
+
+def restore_wifi_capture(wifi: dict[str, Any]) -> None:
+    """Put the kernel netdev back. usbwifi has no netdev of its own.
+
+    Kismet 2026-10 detaches the kernel driver for type=usbwifi and, on this
+    build, does not attach it again when the source closes. Rebind via sysfs
+    when the netdev does not return. That write requires root.
+    """
+    target = wifi_kernel_iface(wifi)
+    if wifi.get("source_type") == "usbwifi":
+        if _wait_netdev(target, 3):
+            restore_wifi(target)
+            reconnect_prior_ssid(wifi, target)
+            return
+        binds = list(wifi.get("usb_binds") or [])
+        usb = str(wifi.get("usb") or "")
+        vid, _, pid = usb.partition(":")
+        if binds:
+            log(
+                "usbwifi left the kernel driver detached. Rebinding "
+                + ", ".join(f"{b['driver']}:{b['sysfs']}" for b in binds)
+                + ".",
+                "warn",
+            )
+            rebind_usb_wifi(binds)
+            if not target:
+                target = netdev_for_usb(vid, pid)
+            if _wait_netdev(target, 8) or _wait_netdev(netdev_for_usb(vid, pid), 2):
+                target = target if target and Path(f"/sys/class/net/{target}").exists() else netdev_for_usb(vid, pid)
+        if target and Path(f"/sys/class/net/{target}").exists():
+            restore_wifi(target)
+            reconnect_prior_ssid(wifi, target)
+            return
+        log(
+            "Kernel Wi-Fi interface did not return after usbwifi closed. "
+            "Re-run as root so the driver can be rebound, or unplug and replug the adapter.",
+            "warn",
+        )
+        invalidate_hardware_cache()
+        return
+    if target and Path(f"/sys/class/net/{target}").exists():
+        restore_wifi(target)
+        reconnect_prior_ssid(wifi, target)
+    elif target:
+        log(f"Not restoring {target}: interface is gone.", "warn")
 
 
 class KismetClient:
@@ -2955,6 +3534,46 @@ class KismetClient:
         if not raw.strip():
             return {}
         return json.loads(raw)
+
+    def post_json(self, path: str, payload: dict[str, Any], timeout: float = 4) -> Any:
+        token = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+        raw_json = json.dumps(payload).encode()
+        bodies = (
+            (raw_json, "application/json"),
+            (
+                urllib.parse.urlencode({"json": raw_json.decode()}).encode(),
+                "application/x-www-form-urlencoded",
+            ),
+        )
+        errors: list[str] = []
+        for body, content_type in bodies:
+            req = urllib.request.Request(
+                self.base + path,
+                data=body,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": content_type,
+                    "Authorization": f"Basic {token}",
+                },
+                method="POST",
+            )
+            try:
+                with self.opener.open(req, timeout=timeout) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                if not text.strip():
+                    return []
+                return json.loads(text)
+            except urllib.error.HTTPError as exc:
+                errors.append(f"{content_type}: HTTP {exc.code}")
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+                if exc.code not in {400, 404, 405, 415, 500}:
+                    raise
+            except (TimeoutError, OSError, json.JSONDecodeError):
+                raise
+        raise urllib.error.URLError("Kismet POST failed: " + "; ".join(errors))
 
 
 def wait_for_kismet(
@@ -3159,22 +3778,25 @@ def stop_kismet(proc: subprocess.Popen[bytes] | None) -> None:
         return
     handle = getattr(proc, "_log_handle", None)
     if proc.poll() is None:
+        # Signal the server only. A group SIGINT also kills capture helpers
+        # immediately, and kismet_cap_usbwifi then skips libusb_attach_kernel_driver,
+        # leaving the USB Wi-Fi adapter unbound.
         try:
-            os.killpg(proc.pid, signal.SIGINT)
+            os.kill(proc.pid, signal.SIGINT)
         except OSError:
             proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=12)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             log("Kismet did not exit on SIGINT; sending SIGTERM.", "warn")
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.kill(proc.pid, signal.SIGTERM)
             except OSError:
                 proc.terminate()
             try:
-                proc.wait(timeout=6)
+                proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                log("Kismet still running; sending SIGKILL.", "warn")
+                log("Kismet still running; sending SIGKILL to its process group.", "warn")
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except OSError:
@@ -3220,6 +3842,17 @@ def unique_join(values: list[str]) -> str:
     return "; ".join(seen)
 
 
+def iter_named_records(blob: Any) -> list[dict[str, Any]]:
+    """Kismet SSID maps are objects, or arrays since the 2019 ELK export change."""
+    if isinstance(blob, dict):
+        values = blob.values()
+    elif isinstance(blob, list):
+        values = blob
+    else:
+        return []
+    return [item for item in values if isinstance(item, dict)]
+
+
 def extract_ssids(dot11: dict[str, Any]) -> tuple[str, str]:
     beaconed: list[str] = []
     probed: list[str] = []
@@ -3227,27 +3860,56 @@ def extract_ssids(dot11: dict[str, Any]) -> tuple[str, str]:
     ssid = kg(last_b, "dot11.advertisedssid.ssid", default="")
     if ssid:
         beaconed.append(str(ssid))
-    adv = kg(dot11, "dot11.device.advertised_ssid_map", default={}) or {}
-    if isinstance(adv, dict):
-        for rec in adv.values():
-            if isinstance(rec, dict):
-                value = kg(rec, "dot11.advertisedssid.ssid", default="")
-                if value:
-                    beaconed.append(str(value))
+    for rec in iter_named_records(kg(dot11, "dot11.device.advertised_ssid_map", default={})):
+        value = kg(rec, "dot11.advertisedssid.ssid", default="")
+        if value:
+            beaconed.append(str(value))
     last_p = kg(dot11, "dot11.device.last_probed_ssid_record", default={}) or {}
     pssid = kg(last_p, "dot11.probedssid.ssid", default="")
     if pssid:
         probed.append(str(pssid))
     pmap = kg(dot11, "dot11.device.probed_ssid_map", default={}) or {}
-    if isinstance(pmap, dict):
-        for rec in pmap.values():
-            if isinstance(rec, dict):
-                value = kg(rec, "dot11.probedssid.ssid", default="") or rec.get("ssid", "")
-                if value:
-                    probed.append(str(value))
-            elif isinstance(rec, str):
+    for rec in iter_named_records(pmap):
+        value = kg(rec, "dot11.probedssid.ssid", default="") or rec.get("ssid", "")
+        if value:
+            probed.append(str(value))
+    if isinstance(pmap, list):
+        for rec in pmap:
+            if isinstance(rec, str) and rec.strip():
                 probed.append(rec)
     return unique_join(beaconed), unique_join(probed)
+
+
+def crypt_text(value: Any) -> str:
+    """Printable crypt. Kismet 2026-10 adds crypt_string; the old crypt field remains."""
+    if value is None or isinstance(value, (dict, list, bool)):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int):
+        return "" if value == 0 else str(value)
+    text = str(value).strip()
+    if text in {"", "0", "None"}:
+        return ""
+    return text
+
+
+def extract_encryption(devjson: dict[str, Any], dot11: Any) -> str:
+    found: list[str] = []
+    if isinstance(dot11, dict):
+        records: list[dict[str, Any]] = []
+        last = kg(dot11, "dot11.device.last_beaconed_ssid_record", default={}) or {}
+        if isinstance(last, dict):
+            records.append(last)
+        records.extend(iter_named_records(kg(dot11, "dot11.device.advertised_ssid_map", default={})))
+        for rec in records:
+            text = crypt_text(kg(rec, "dot11.advertisedssid.crypt_string", default=""))
+            if text:
+                found.append(text)
+    base = crypt_text(kg(devjson, "kismet.device.base.crypt", default=""))
+    if base:
+        found.append(base)
+    return unique_join(found)
 
 
 def extract_machine_names(devjson: dict[str, Any], ssid: str, bt_name: str) -> str:
@@ -3292,6 +3954,9 @@ def extract_location(devjson: dict[str, Any], row: dict[str, Any]) -> dict[str, 
     loc["gps_min"] = min_pair
     loc["gps_max"] = max_pair
 
+    # Kismet 2026-10-R1: this object is where Kismet was when it heard the
+    # device. Positions a device reports for itself (ADS-B, AIS, Remote ID)
+    # are in kismet.device.base.reported_location and are not the survey track.
     blob = kg(devjson, "kismet.device.base.location", default={}) or {}
     last = kg(blob, "kismet.common.location.last", default={}) or {}
     pt = kg(last, "kismet.common.location.geopoint", default=None)
@@ -3372,7 +4037,7 @@ def extract_device_record(row: dict[str, Any], collector_macs: set[str]) -> dict
         "signal_last_dbm": last_sig,
         "signal_min_dbm": min_sig,
         "signal_max_dbm": max_sig if max_sig not in ("", None) else row.get("strongest_signal", ""),
-        "encryption": kg(devjson, "kismet.device.base.crypt", default=""),
+        "encryption": extract_encryption(devjson, dot11),
         "first_seen": iso_utc(row.get("first_time")),
         "last_seen": iso_utc(row.get("last_time")),
         "packets": kg(devjson, "kismet.device.base.packets.total", default="")
@@ -3381,6 +4046,33 @@ def extract_device_record(row: dict[str, Any], collector_macs: set[str]) -> dict
         "collector_radio": "yes" if mac in collector_macs else "no",
         **loc,
     }
+    adv_tx = ""
+    if isinstance(dot11, dict):
+        last_beacon = kg(dot11, "dot11.device.last_beaconed_ssid_record", default={}) or {}
+        if isinstance(last_beacon, dict):
+            adv_tx = kg(last_beacon, "dot11.advertisedssid.advertised_txpower", default="")
+    tx = resolve_tx_dbm(str(phy), str(dtype), ssid, adv_tx)
+    range_mhz = freq_mhz
+    try:
+        range_ok = 100.0 <= float(freq_mhz) <= 10000.0
+    except (TypeError, ValueError):
+        range_ok = False
+    if not range_ok:
+        # Phy "unspecified" skips the 2437 MHz guess, so only a real
+        # channel number is written into the report.
+        from_channel = frequency_mhz_for_range(None, rec.get("channel"), "unspecified")
+        if from_channel:
+            range_mhz = f"{from_channel:.3f}"
+            rec["frequency_mhz"] = range_mhz
+        else:
+            fallback = frequency_mhz_for_range(freq, rec.get("channel"), str(phy))
+            range_mhz = f"{fallback:.3f}" if fallback else ""
+    strong = rec["signal_max_dbm"]
+    if strong in ("", None):
+        strong = rec["signal_last_dbm"]
+    closest = format_distance(estimate_distance_m(strong, range_mhz, tx))
+    furthest = format_distance(estimate_distance_m(rec["signal_min_dbm"], range_mhz, tx))
+    rec["closest_m"], rec["furthest_m"] = order_distance_pair(closest, furthest)
     return rec
 
 
@@ -3524,6 +4216,8 @@ def csv_fields() -> list[str]:
         "encryption",
         "first_seen",
         "last_seen",
+        "closest_m",
+        "furthest_m",
         "packets",
         "gps_lat",
         "gps_lon",
@@ -3770,6 +4464,9 @@ def write_reports(outdir: Path, payload: dict[str, Any]) -> None:
     log(f"All devices : {csv_all}", "ok")
     log(f"Wi-Fi CSV   : {csv_wifi}", "ok")
     log(f"Bluetooth   : {csv_bt}", "ok")
+    hop_log_path = outdir / HOP_LOG_NAME
+    if hop_log_path.is_file():
+        log(f"Hop log     : {hop_log_path}", "ok")
     if track:
         log(f"GPS track   : {csv_gps}", "ok")
 
@@ -3810,43 +4507,309 @@ def match_named(items: list[dict[str, Any]], name: str, key: str) -> dict[str, A
     return None
 
 
+def _plain_field(value: Any) -> str:
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return str(value).strip()
+
+
+def _plain_ssid(value: Any) -> str:
+    """SSIDs are strings. Kismet returns numeric 0 when a device has none."""
+    if value is None or isinstance(value, (dict, list, bool, int, float)):
+        return ""
+    return str(value).strip()
+
+
+def normalize_live_device(dev: dict[str, Any]) -> dict[str, Any]:
+    """Accept either a field-simplified device or a full Kismet device object."""
+
+    def pick(alias: str, *path: str) -> Any:
+        if alias in dev and not isinstance(dev[alias], (dict, list)):
+            return dev[alias]
+        # kg() with an empty path returns the whole device, not a field.
+        if not path:
+            return ""
+        return kg(dev, *path, default="")
+
+    ssid = _plain_ssid(pick("ssid"))
+    if not ssid:
+        ssid = _plain_ssid(
+            kg(
+                dev,
+                "dot11.device",
+                "dot11.device.last_beaconed_ssid_record",
+                "dot11.advertisedssid.ssid",
+                default="",
+            )
+        )
+    tx_power = pick(
+        "tx_power",
+        "dot11.device",
+        "dot11.device.last_beaconed_ssid_record",
+        "dot11.advertisedssid.advertised_txpower",
+    )
+    if isinstance(tx_power, (dict, list)):
+        tx_power = ""
+    signal = pick(
+        "signal",
+        "kismet.device.base.signal",
+        "kismet.common.signal.last_signal",
+    )
+    return {
+        "mac": _plain_field(pick("mac", "kismet.device.base.macaddr")).upper(),
+        "phy": _plain_field(pick("phy", "kismet.device.base.phyname")),
+        "type": _plain_field(pick("type", "kismet.device.base.type")),
+        "channel": _plain_field(pick("channel", "kismet.device.base.channel")),
+        "frequency": pick("frequency", "kismet.device.base.frequency"),
+        "last_time": pick("last_time", "kismet.device.base.last_time"),
+        "packets": pick("packets", "kismet.device.base.packets.total"),
+        "signal": signal,
+        "signal_min": pick(
+            "signal_min",
+            "kismet.device.base.signal",
+            "kismet.common.signal.min_signal",
+        ),
+        "signal_max": pick(
+            "signal_max",
+            "kismet.device.base.signal",
+            "kismet.common.signal.max_signal",
+        ),
+        "ssid": ssid,
+        "tx_power": tx_power,
+    }
+
+
+_live_device_fields = LIVE_DEVICE_FIELDS
+
+
+def fetch_recent_devices(client: KismetClient, since_unix: int) -> list[dict[str, Any]]:
+    """Devices Kismet has heard since since_unix (absolute epoch seconds)."""
+    global _live_device_fields
+    path = f"/devices/last-time/{max(int(since_unix), 0)}/devices.json"
+
+    def _pull(fields: list[Any]) -> Any:
+        return client.post_json(path, {"fields": fields}, timeout=2.5)
+
+    try:
+        data = _pull(_live_device_fields)
+    except urllib.error.URLError as exc:
+        # Field simplification errors come back as HTTP 4xx/5xx. A timeout
+        # or a refused connection does not, and must not drop the SSID fields.
+        field_error = isinstance(exc, urllib.error.HTTPError) or "POST failed" in str(exc)
+        if field_error and _live_device_fields is not LIVE_DEVICE_FIELDS_BASIC:
+            _live_device_fields = LIVE_DEVICE_FIELDS_BASIC
+            log(
+                "Kismet rejected the SSID fields on the hop poll. "
+                "Continuing with MAC, signal, and channel only.",
+                "warn",
+            )
+            data = _pull(_live_device_fields)
+        else:
+            raise
+    if isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, list):
+                data = value
+                break
+    if not isinstance(data, list):
+        return []
+    devices: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_live_device(item)
+        if not normalized["mac"] and not getattr(fetch_recent_devices, "warned_shape", False):
+            fetch_recent_devices.warned_shape = True  # type: ignore[attr-defined]
+            log(
+                "Hop poll returned a device with no MAC. "
+                f"Keys: {', '.join(list(item)[:12])}",
+                "warn",
+            )
+        devices.append(normalized)
+    return devices
+
+
+class HopLog:
+    """CSV of devices that changed, fsynced so a crash keeps completed samples.
+
+    `hop` counts every poll, starting at 1. The poll is scheduled once per
+    channel dwell (the hop rate). It is this script's sample number, not
+    Kismet's channel index. A poll that sees no change writes no rows and
+    is not synced, so the hop column skips: 2, 4, 9 means samples 1, 3,
+    and 5–8 had nothing new. A row is written when a MAC's packet count,
+    last signal, strongest or weakest signal, or last-heard time differs
+    from the last row stored for that MAC. The first time a MAC is seen,
+    that counts as a change. Rows from the same poll share one timestamp
+    and one hop number.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.hop = 0
+        self.rows = 0
+        self._seen: dict[str, tuple[Any, Any, Any]] = {}
+        self._last_error_log = 0.0
+        self._fh = path.open("a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._fh, fieldnames=HOP_LOG_FIELDS, extrasaction="ignore"
+        )
+        if path.stat().st_size == 0:
+            self._writer.writeheader()
+            self._commit()
+
+    def _commit(self) -> None:
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        if self._fh.closed:
+            return
+        try:
+            self._commit()
+        finally:
+            self._fh.close()
+
+    def note_error(self, exc: Exception) -> None:
+        now = time.time()
+        if now - self._last_error_log < 10:
+            return
+        self._last_error_log = now
+        log(
+            f"Hop log sample failed ({exc}). Capture continues; "
+            "rows already synced are still on disk.",
+            "warn",
+        )
+
+    def append_sample(self, devices: list[dict[str, Any]]) -> int:
+        # Always advance. Quiet polls stay out of the file, so hop numbers gap.
+        self.hop += 1
+        stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        wrote = 0
+        for dev in devices:
+            mac = str(dev.get("mac") or "").upper()
+            if not mac:
+                continue
+            # Unchanged across these five fields means "not heard again".
+            # Kismet's last_time ticks in whole seconds, so a steady
+            # transmitter is often logged about once a second.
+            signature = (
+                dev.get("last_time"),
+                dev.get("packets"),
+                dev.get("signal"),
+                dev.get("signal_min"),
+                dev.get("signal_max"),
+            )
+            if self._seen.get(mac) == signature:
+                continue
+            self._seen[mac] = signature
+            phy = str(dev.get("phy") or "")
+            dtype = str(dev.get("type") or "")
+            ssid = str(dev.get("ssid") or "")
+            freq = frequency_mhz_for_range(dev.get("frequency"), dev.get("channel"), phy)
+            tx = resolve_tx_dbm(phy, dtype, ssid, dev.get("tx_power"))
+            signal_text = format_dbm(dev.get("signal"))
+            distance = ""
+            if signal_text:
+                distance = format_distance(
+                    estimate_distance_m(signal_text, freq, tx)
+                )
+            self._writer.writerow(
+                {
+                    "hop": self.hop,
+                    "timestamp": stamp,
+                    "mac": mac,
+                    "phy": phy,
+                    "type": dtype,
+                    "ssid": ssid,
+                    "channel": dev.get("channel") or "",
+                    "frequency_mhz": f"{freq:.3f}" if freq else "",
+                    "signal_dbm": signal_text,
+                    "distance_m": distance,
+                    "tx_dbm": f"{tx:.1f}",
+                    "path_loss_exponent": f"{PATH_LOSS_EXPONENT:.1f}",
+                }
+            )
+            wrote += 1
+        if wrote:
+            self._commit()
+            self.rows += wrote
+        return wrote
+
+
+def _raise_keyboard_interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
 def capture_loop(
     client: KismetClient,
     proc: subprocess.Popen[bytes],
     duration: int | None,
+    hop_log: HopLog | None = None,
+    hop_rate: int = DEFAULT_HOP_RATE,
 ) -> None:
     started = time.time()
+    interval = 1.0 / max(int(hop_rate), 1)
+    next_status = 0.0
+    next_hop = time.monotonic()
+    # Overlap the "seen since" query by a few seconds. Kismet's last-heard
+    # time is whole seconds, and a strict cutoff drops a packet that lands
+    # on the boundary. Unchanged devices are not written twice.
+    since_ts = int(started) - 4
     log("Capture running. Press Ctrl-C to stop." + (f" Duration={duration}s." if duration else ""))
     log("Kismet web UI: http://127.0.0.1:2501 (local only)")
+    if hop_log is not None:
+        log(
+            f"Hop log records a device when its packets, signal, or "
+            f"last-heard time change ({hop_rate} samples/sec) and syncs "
+            f"those rows. Quiet samples increment hop and add no rows."
+        )
+    old_term = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
         while True:
             if proc.poll() is not None:
                 log(f"Kismet exited early with code {proc.returncode}.", "err")
                 return
-            elapsed = int(time.time() - started)
+            now = time.time()
+            elapsed = int(now - started)
             if duration is not None and elapsed >= duration:
                 log("Duration reached; stopping capture.", "ok")
                 return
-            info = live_counts(client)
-            gps = info.get("gps") or {}
-            if gps.get("valid"):
-                gps_s = f"{gps['lat']:.6f},{gps['lon']:.6f} fix={gps.get('fix') or '3D'}"
-            elif gps.get("sats"):
-                gps_s = f"searching ({gps['sats']} sats; window/sky)"
-            elif gps.get("connected"):
-                gps_s = "receiver up, 0 sats (place puck by a window; wait 1–5 min)"
-            else:
-                gps_s = "not connected"
-            phys = info.get("phys") or {}
-            phy_s = ", ".join(f"{k}={v}" for k, v in phys.items()) or f"total={info.get('devices')}"
-            remain = ""
-            if duration is not None:
-                remain = f"  remaining={max(duration - elapsed, 0)}s"
-            log(f"t={elapsed}s  GPS {gps_s}  devices {phy_s}{remain}")
-            time.sleep(5)
+            if hop_log is not None and time.monotonic() >= next_hop:
+                try:
+                    heard = fetch_recent_devices(client, since_ts)
+                    hop_log.append_sample(heard)
+                    since_ts = int(time.time()) - 4
+                except Exception as exc:
+                    hop_log.note_error(exc)
+                    since_ts = int(time.time()) - 4
+                next_hop = time.monotonic() + interval
+            if now >= next_status:
+                info = live_counts(client)
+                gps = info.get("gps") or {}
+                if gps.get("valid"):
+                    gps_s = f"{gps['lat']:.6f},{gps['lon']:.6f} fix={gps.get('fix') or '3D'}"
+                elif gps.get("sats"):
+                    gps_s = f"searching ({gps['sats']} sats; window/sky)"
+                elif gps.get("connected"):
+                    gps_s = "receiver up, 0 sats (place puck by a window; wait 1–5 min)"
+                else:
+                    gps_s = "not connected"
+                phys = info.get("phys") or {}
+                phy_s = ", ".join(f"{k}={v}" for k, v in phys.items()) or f"total={info.get('devices')}"
+                remain = ""
+                if duration is not None:
+                    remain = f"  remaining={max(duration - elapsed, 0)}s"
+                hop_s = ""
+                if hop_log is not None:
+                    hop_s = f"  hop={hop_log.hop} logged={hop_log.rows}"
+                log(f"t={elapsed}s  GPS {gps_s}  devices {phy_s}{hop_s}{remain}")
+                next_status = now + 5
+            time.sleep(min(0.05, interval / 2))
     except KeyboardInterrupt:
         print()
         log("Stop requested.", "warn")
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
 
 
 def reprocess_outdir(outdir: Path, ieee_policy: str) -> int:
@@ -4115,16 +5078,21 @@ def main() -> int:
             "if capture is empty, use a USB adapter that supports monitor mode.",
             "warn",
         )
+    uplink = default_route_iface()
+    kernel_iface = wifi_kernel_iface(wifi)
+    if kernel_iface and kernel_iface == uplink:
+        log(
+            f"{kernel_iface} carries the IPv4 default route. "
+            "Monitor mode will drop that link until the capture ends.",
+            "warn",
+        )
     if str(wifi.get("rfkill") or "") in {"soft-blocked", "hard-blocked"}:
         log(f"{wifi['iface']} is {wifi['rfkill']}. Will attempt rfkill unblock.", "warn")
 
     title = sanitize_title(test_name)
     outdir = Path(args.outdir).expanduser().resolve() if args.outdir else Path(f"{TOOL_ID}_{timestamp()}").resolve()
     http_port = args.http_port
-    sources = [
-        f"{wifi['iface']}:name={sanitize_title(wifi.get('hint') or wifi['iface'])},"
-        f"hop=true,hoprate={hop_rate}/sec"
-    ]
+    sources = [wifi_source_definition(wifi, hop_rate)]
     if bt:
         if bt.get("source_type") == "ubertooth" or str(bt.get("iface") or "").startswith(
             "ubertooth"
@@ -4201,13 +5169,20 @@ def main() -> int:
     log("Capture plan", "hdr")
     log(f"Operator   : {userid} / {operator_name}")
     log(f"Test       : {test_name}")
-    log(f"Wi-Fi      : {wifi['iface']} ({wifi.get('hint')})  mac={wifi.get('mac')}")
+    log(
+        f"Wi-Fi      : {wifi['iface']} ({wifi.get('source_type') or 'linuxwifi'}) "
+        f"{wifi.get('hint')}  mac={wifi.get('mac') or '-'}"
+    )
     bt_ifaces = [s.split(":", 1)[0] for s in sources[1:] if "type=ubertooth" in s or "type=linuxbluetooth" in s]
     log(f"Bluetooth  : {', '.join(bt_ifaces) if bt_ifaces else '(disabled)'}")
     log(f"GPS        : {gps['device'] + ' @ ' + str(gps.get('baud')) + ' baud' if gps else '(disabled)'}")
     log(f"Hop rate   : {hop_rate}/sec ({hop_dwell_ms(hop_rate)} ms/channel)")
     log(f"Duration   : {args.duration or 'until Ctrl-C'}")
     log(f"Output     : {outdir}")
+    log(
+        f"Hop log    : {outdir / HOP_LOG_NAME} "
+        "(changed devices only; hop numbers skip quiet samples)"
+    )
     log("Passive    : no injection, deauth, association, or pairing")
 
     if args.dry_run:
@@ -4267,6 +5242,8 @@ def main() -> int:
         "sudo_user": os.environ.get("SUDO_USER") or os.environ.get("USER") or "",
         "host": socket.gethostname(),
         "wifi_iface": wifi["iface"],
+        "wifi_source_type": wifi.get("source_type") or "linuxwifi",
+        "wifi_kernel_iface": kernel_iface,
         "wifi_mac": wifi.get("mac"),
         "wifi_source": sources[0],
         "bluetooth_iface": bt["iface"] if bt else "",
@@ -4278,6 +5255,9 @@ def main() -> int:
         "http_port": http_port,
         "hop_rate_per_sec": hop_rate,
         "hop_dwell_ms": hop_dwell_ms(hop_rate),
+        "hop_log": HOP_LOG_NAME,
+        "distance_model": "log-distance",
+        "path_loss_exponent": PATH_LOSS_EXPONENT,
         "passive": True,
         "injection": False,
         "kismet_version": version,
@@ -4285,13 +5265,32 @@ def main() -> int:
     (outdir / "operator_session.json").write_text(json.dumps(session, indent=2), encoding="utf-8")
 
     unblock_radios()
-    nm_set_managed(wifi["iface"], False)
+    wifi["prior_ssid"] = ""
+    if kernel_iface:
+        for row in parse_iw_dev():
+            if row.get("iface") == kernel_iface:
+                wifi["prior_ssid"] = str(row.get("ssid") or "")
+                break
+    if wifi.get("source_type") == "usbwifi":
+        usb = str(wifi.get("usb") or "")
+        vid, _, pid = usb.partition(":")
+        wifi["usb_binds"] = usb_wifi_binds(vid, pid) or usb_wifi_binds(
+            vid, pid, fallback_driver=str(wifi.get("driver") or "")
+        )
+        if wifi["usb_binds"]:
+            log(
+                "Kernel driver before usbwifi: "
+                + ", ".join(f"{b['driver']}:{b['sysfs']}" for b in wifi["usb_binds"])
+            )
+    if kernel_iface and Path(f"/sys/class/net/{kernel_iface}").exists():
+        nm_set_managed(kernel_iface, False)
 
     client = KismetClient(f"http://127.0.0.1:{http_port}", KISMET_HTTP_USER, password)
     kismet_log = outdir / "kismet_server.log"
     proc: subprocess.Popen[bytes] | None = None
     db_path: Path | None = None
     ble_tap: BleEirTap | None = None
+    hop_log: HopLog | None = None
     try:
         hci_src = next((s for s in sources if "type=linuxbluetooth" in s), "")
         hci_match = re.search(r"hci(\d+)", hci_src, re.I)
@@ -4343,15 +5342,25 @@ def main() -> int:
                 time.sleep(args.duration)
         else:
             log(f"Kismet is up (pid {proc.pid}). Web UI http://127.0.0.1:{http_port}", "ok")
-            capture_loop(client, proc, args.duration or None)
+            hop_log = HopLog(outdir / HOP_LOG_NAME)
+            log(f"Hop log synced each hop: {hop_log.path}", "ok")
+            capture_loop(
+                client,
+                proc,
+                args.duration or None,
+                hop_log=hop_log,
+                hop_rate=hop_rate,
+            )
     finally:
+        if hop_log is not None:
+            hop_log.close()
         log("Stopping Kismet so the log can be finalized...")
         stop_kismet(proc)
         if ble_tap is not None:
             ble_tap.stop()
             log(f"BLE advertisement tap: {ble_tap.seen} event(s) -> {ble_tap.path}")
         stop_gpsd(gpsd_proc)
-        restore_wifi(wifi["iface"])
+        restore_wifi_capture(wifi)
 
     time.sleep(1)
     db_path = find_kismet_db(outdir)

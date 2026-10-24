@@ -73,7 +73,7 @@ Any Linux host with:
 
 | Role           | What works                        | Notes                                                                                                                                          |
 | -------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Wi-Fi          | USB adapter with **monitor mode** | Preferred. MediaTek mt76 / Panda-class (`mt7921u`, etc.) are well supported. Built-in Intel often works but is usually a poorer capture radio. |
+| Wi-Fi          | USB adapter with **monitor mode** | Preferred. On Kismet 2026-10 or newer, a MediaTek mt76 / Panda (`mt7921u`, USB `0e8d:7961`) is listed twice: `mt7921-0` (`type=usbwifi`, userspace driver) and `wlx…` (kernel driver). Pick `mt7921-0`. Built-in Intel stays on the kernel source (`linuxwifi`) and is usually a poorer capture radio. |
 | Bluetooth      | BlueZ `hci` and/or **Ubertooth One** | Built-in Intel is fine for names. An Ubertooth One sniffs BTLE advertisements (manufacturer IDs). `--setup` installs the helper, tools, and udev rules. |
 | GPS (optional) | USB NMEA receiver                 | GlobalSat BU-353S4 (Prolific `067b:2303`) is autodetected at 4800 baud. Other NMEA USB GPSes on `/dev/ttyUSB*` or `/dev/ttyACM*` work too.     |
 
@@ -96,9 +96,29 @@ python3 flute.py --check
 sudo python3 flute.py
 ```
 
-`--setup` uses `apt`, `dnf`, or `pacman` depending on the distro. On Pop!_OS, Ubuntu, and Debian, Kismet is often **not** in the default repos; setup adds the [official Kismet apt repository](https://www.kismetwireless.net/packages/) (release, then git/nightly if needed), then installs `kismet` plus `iw`, `rfkill`, `gpsd`, and (when the packages exist) `kismet-capture-ubertooth-one`, `ubertooth`, and `ubertooth-firmware`. It also writes `/etc/udev/rules.d/99-flute-ubertooth.rules` so the Ubertooth USB device is `0660` for the `kismet` group.
+`--setup` uses `apt`, `dnf`, or `pacman` depending on the distro. On Pop!_OS, Ubuntu, and Debian, Kismet is often **not** in the default repos; setup adds the [official Kismet apt repository](https://www.kismetwireless.net/packages/) (release, then git/nightly if needed), then installs `kismet` plus `iw`, `rfkill`, `gpsd`, and (when the packages exist) `kismet-capture-linux-wifi`, `kismet-capture-linux-bluetooth`, `kismet-capture-ubertooth-one`, `kismet-capture-usbwifi`, `ubertooth`, and `ubertooth-firmware`. It also writes `/etc/udev/rules.d/99-flute-ubertooth.rules` so the Ubertooth USB device is `0660` for the `kismet` group.
 
 Do **not** run `ubertooth-util -i` on Ubuntu’s package — that flag enters ISP/DFU mode. Setup uses `ubertooth-util -v` only. If the stick shows USB id `1d50:6003`, unplug and re-insert it.
+
+### Kismet capture helper privileges (udev vs suid)
+
+When the Kismet packages configure (especially USB/serial capture helpers such as BladeRF, Ubertooth, or SDR datasources), the installer asks:
+
+> How should Kismet USB and serial capture helpers access devices?
+
+Choose **udev**. The dialog itself marks this as the recommended option. It installs udev rules that give members of the `kismet` group access to the supported devices. The capture helpers then run without extra privileges.
+
+**suid** installs the helpers setuid-root (executable only by the `kismet` group). While functional, it is less secure than udev + capabilities.
+
+The Magic Flute `--setup` already:
+
+- preseeds the Kismet 2026-10 debconf questions noninteractively: `kismet-common/install-setuid` = **true** (Linux Wi-Fi and Bluetooth get file capabilities; `kismet_cap_usbwifi` is setuid-root because it has to unbind the kernel driver), and `kismet-common/device-access` = **udev** (Ubertooth and other USB/serial sniffers),
+- applies `setcap cap_net_admin,cap_net_raw` to the Linux Wi-Fi and HCI helpers if the package did not, and
+- writes its own udev rule for the Ubertooth One.
+
+Selecting **udev** for USB/serial helpers matches this. After installation (or if you reconfigure later with `dpkg-reconfigure`), ensure your user is in the `kismet` group and log out/in so the group membership takes effect.
+
+`kismet_cap_usbwifi` is not a udev-only helper. Without setuid (or running the capture as root) it cannot detach `mt7921u` / `rtw88` and the `mt7921-0` source will not open. The kernel interface (`wlx…`) still works through `kismet_cap_linux_wifi`.
 
 ## What `--setup` and each capture do
 
@@ -106,7 +126,7 @@ Lessons from field use are built in:
 
 | Step                                                        | Why                                                                 |
 | ----------------------------------------------------------- | ------------------------------------------------------------------- |
-| Install Kismet + `kismet_cap_linux_wifi` / `linuxbluetooth` / `ubertooth_one` | Capture helpers |
+| Install Kismet + `kismet_cap_linux_wifi` / `linuxbluetooth` / `usbwifi` / `ubertooth_one` | Capture helpers. `usbwifi` is the Kismet 2026-10 userspace USB Wi-Fi source |
 | `setcap cap_net_admin,cap_net_raw` on the Linux Wi-Fi/HCI helpers | Monitor mode without full root |
 | Add the login user to `kismet`, `dialout`, and `plugdev`    | Helpers + USB GPS + Ubertooth USB |
 | Ubertooth udev rule `99-flute-ubertooth.rules`              | Non-root can claim the sniffer (`1d50:6002`) |
@@ -119,7 +139,7 @@ Lessons from field use are built in:
 | Offer to refresh IEEE MAC vendors + BT SIG IDs if missing or >180 days | Asks first (default no) so air-gapped hosts are not blocked |
 | Label random BLE / locally administered MACs honestly       | Extra OUI files cannot identify privacy addresses                   |
 | Tap BlueZ `DEVICE_FOUND` EIR while Kismet runs              | Kismet HCI drops company IDs; this is how Apple/Samsung/Moto show up |
-| Restore the Wi-Fi iface when the run ends                   | Laptop networking comes back                                        |
+| Restore the Wi-Fi iface when the run ends                   | If it was associated, NetworkManager is asked to reconnect it. Deleting a leftover `*mon` interface needs root |
 
 A hardware airplane/kill switch (**hard** rfkill) cannot be overridden. Flip the switch.
 
@@ -131,7 +151,7 @@ For each observed device:
 - SSID (beaconed) and probed SSIDs, when present
 - Signal strength (last / min / max dBm)
 - Frequency and channel
-- GPS coordinates (last / average / min-max), when a GPS has a fix
+- GPS coordinates (last / average / min-max), when a GPS has a fix. As of Kismet 2026-10-R1 these are where **this** Kismet was when it heard the device. A position the device reports for itself (ADS-B, AIS, Remote ID) stays in Kismet's `reported_location` and is not copied into these columns.
 - Advertised machine names (Kismet name, DHCP hostname, WPS device name, Bluetooth local name)
 
 Wi-Fi is **monitor mode, receive only**. The radio listens continuously on the current channel; it does **not** run periodic `iw scan` polls. Kismet hops channels at a configurable rate (default **5 hops per second**, 200 ms on each channel).
@@ -204,14 +224,14 @@ sudo python3 flute.py \
   --userid jsmith \
   --operator-name "Jane Doe" \
   --test-name "Warehouse 4 north wing" \
-  --wifi wlx9cefd5f63b21 \
+  --wifi mt7921-0 \
   --bluetooth hci0 \
   --hop-rate 5 \
   --no-download-ieee \
   --duration 1800
 ```
 
-Replace `wlx9cefd5f63b21` with the interface `--check` or `--list-only` reports.
+Replace `mt7921-0` with the interface `--check` or `--list-only` reports. On Kismet 2026-10 that name is the userspace USB source. The kernel name (`wlx…`, or built-in `wlp…`) still works and is what you pass when `usbwifi` is not installed. Do not capture on `mt7921-0` and its `wlx…` partner at the same time: opening `usbwifi` detaches the kernel driver.
 
 ```bash
 python3 flute.py --list-only
@@ -226,7 +246,7 @@ sudo python3 flute.py \
   --userid jsmith \
   --operator-name "Jane Doe" \
   --test-name "Lab check" \
-  --wifi wlx9cefd5f63b21 \
+  --wifi mt7921-0 \
   --no-bluetooth \
   --no-gps \
   --hop-rate 5 \
@@ -271,32 +291,39 @@ Default directory: `flute_YYYYMMDDTHHMMSSZ/`
 | `flute_report.json`     | Full structured result                                                          |
 | `flute_report.txt`      | Human-readable report                                                           |
 | `flute_report.md`       | Markdown report                                                                 |
-| `flute_devices.csv`     | Every device (MAC, SSID, `ieee_manufacturer`, `mac_kind`, `bt_company`, `bt_uuids`, signal, frequency, GPS, names) |
+| `flute_devices.csv`     | Every device (MAC, SSID, `ieee_manufacturer`, `mac_kind`, `bt_company`, `bt_uuids`, signal, frequency, GPS, names, `closest_m`, `furthest_m`) |
 | `ble_advertisements.jsonl` | Raw BLE AD/EIR from the BlueZ tap (company IDs, UUIDs). Empty if the tap could not bind. |
-| `flute_wifi.csv`        | Wi-Fi subset                                                                    |
-| `flute_bluetooth.csv`   | Bluetooth subset                                                                |
+| `flute_wifi.csv`        | Wi-Fi subset (same columns, including `closest_m` and `furthest_m`)            |
+| `flute_bluetooth.csv`   | Bluetooth subset (same columns, including `closest_m` and `furthest_m`)        |
+| `flute_hop_log.csv`     | Devices whose packets, signal, or last-heard time changed on a sample. The `hop` column skips samples with no change. Appended and synced during the capture so a crash keeps completed samples. |
 | `flute_gps_track.csv`   | Surveyor track (when a fix existed)                                             |
 | `*.kismet`              | Native Kismet database                                                          |
 | `kismet_server.log`     | Kismet stdout                                                                   |
 
 Do not commit capture output. Indoor GPS can take minutes or fail; the script keeps collecting and leaves coordinates empty until there is a fix.
 
+## Hop log
+
+`flute_hop_log.csv` is opened when Kismet comes up. The script polls Kismet once per channel dwell (the hop rate, default 5/sec, so a poll is scheduled every 200 ms). Each poll increments a sample counter named `hop`, whether or not anything is written.
+
+A row is written only when a device changed since the previous sample (new packets, different signal, or a newer last-heard time). Devices that are quiet are not repeated. The `hop` value in the file therefore skips samples that had no change, so the column is not a continuous 1, 2, 3, … sequence.
+
+The file is flushed after every write so a Ctrl-C or crash keeps the completed samples.
+
 ## Troubleshooting
 
-| Symptom                                      | What to check                                                                         |
-| -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Missing Kismet / helpers                     | `sudo python3 flute.py --setup` (adds the official Kismet apt repo on Ubuntu/Pop/Debian) |
-| `Unable to locate package kismet`            | Distro repos lack Kismet. Re-run `--setup` (now adds kismetwireless.net) or see https://www.kismetwireless.net/packages/ |
-| Not in `kismet` or `dialout`                 | `--setup`, then **log out and back in**                                               |
-| No wireless controllers                      | USB adapter seated; `python3 flute.py --check`                                        |
-| Empty Wi-Fi results                          | Monitor mode? `rfkill list`; pick the USB adapter, not a client-only dongle           |
-| GPS missing / permission denied              | `ls -l /dev/ttyUSB0`; `--setup` for dialout, or `sudo`; baud 4800                     |
-| GPS “binary data, not NMEA” / no-fix forever | BU-353S4 in SiRF mode. `sudo python3 flute.py --setup` (installs gpsd) and re-run     |
-| GPS connected / searching, never a fix       | Empty systemd `gpsd.socket` used to cause this. Update `flute.py` and re-run with sudo. Put the puck on a windowsill. |
-| Leftover `kismon0`                           | `sudo iw dev kismon0 del` (the script tries; deleting a VAP needs net-admin)          |
-| Port 2501 in use                             | Another Kismet is running. Stop it or pass `--http-port`                              |
+| Symptom                                  | What to try                                                                                   |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------- |
+| “Permission denied” on Wi-Fi or Bluetooth | `sudo python3 flute.py --setup`, then log out and back in (group membership)                 |
+| Monitor mode fails                       | Adapter may not support monitor mode. Prefer a USB MediaTek/`mt76` card. On Kismet 2026-10 try the `mt7921-0` usbwifi source before the kernel `wlx…` interface. |
+| No devices after a few minutes           | Confirm the adapter is in monitor mode (`iw dev`). Soft rfkill is cleared by the script.     |
+| GPS stuck on “searching”                 | Clear sky, window, or outdoors. Cold start can take 30–60 s. Indoor may never fix.           |
+| GPS not connected / no `/dev/ttyUSB*`    | `sudo python3 flute.py --setup` (dialout + udev), unplug/replug the puck, or `--no-gps`.     |
 | Bluetooth empty                              | `rfkill unblock bluetooth`; or `--no-bluetooth`                                       |
 | Ubertooth not listed / USB permission        | `sudo python3 flute.py --setup`, unplug/replug. Do not run `ubertooth-util -i` (ISP). |
+| `mt7921-0` / usbwifi will not open           | `kismet_cap_usbwifi` must be setuid-root or the capture must run as root. `--setup` preseeds that. Otherwise pass the kernel `wlx…` name to `--wifi`. |
+| `wlx…` missing after a usbwifi capture       | Kismet 2026-10 detaches the kernel driver and does not attach it again. Run the capture as root so Flute can rebind it (`sudo python3 flute.py`). Otherwise unplug and replug the adapter. |
+| One USB adapter listed twice                 | Expected on Kismet 2026-10. `mt7921-0` is usbwifi (preferred). `wlx…` is the kernel driver. |
 | Ubertooth USB id `1d50:6003`                 | DFU/ISP mode. Unplug and re-insert. Flash only if it stays there (`ubertooth-firmware`). |
 | Ubertooth finds few devices                  | It sniffs **channel 37 only** (firmware hangs if hopped). HCI still sees names on all ads. |
 | `--bluetooth ubertooth-0` shows 0 Bluetooth devices | Kismet launched Ubertooth but **dropped CRC-fail packets** (228 frames in the Cyber Lab run, 0 devices). Host libubertooth is API 1.06, stick firmware is 1.07. Flute now also enables Linux HCI unless you pass `--no-hci`. Re-run: `sudo python3 flute.py --bluetooth ubertooth-0` |
