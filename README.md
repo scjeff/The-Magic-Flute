@@ -343,11 +343,21 @@ The GPL covers copyright of the software. It does **not** authorize wireless col
 
 ## Repository contents
 
+Git tracks only the program and its docs:
+
 ```
-flute.py               # setup, checks, Kismet launcher, reports (GPL-3.0-or-later)
-ieee_mac_vendors.csv   # IEEE OUI cache (optional download; not in git)
-bt_company_ids.csv     # Bluetooth SIG company IDs (optional download; not in git)
+flute.py     # setup, checks, Kismet launcher, reports (GPL-3.0-or-later)
 README.md
-LICENSE                # GNU GPL v3
+LICENSE      # GNU GPL v3
 .gitignore
 ```
+
+`ieee_mac_vendors.csv` and `bt_company_ids.csv` are **not** in the repository. They are MAC and Bluetooth company lookup caches, and they go stale, so they are created next to `flute.py` instead of being committed.
+
+`--setup`, `--check`, and a capture all look for those two files. If either is missing or older than 180 days, the tool asks whether to download it. The default answer is **no**, so an air-gapped host can continue. To download them as part of setup:
+
+```bash
+sudo python3 flute.py --setup --download-ieee
+```
+
+`--download-ieee` also works with `--check` and with a capture. `--no-download-ieee` never fetches. Until the IEEE file is present, public MAC manufacturers stay `Unknown`. If the Bluetooth SIG file is absent, company names fall back to Kismet’s `kismet_bluetooth_manuf.txt.gz`.
