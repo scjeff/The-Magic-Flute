@@ -190,7 +190,7 @@ This is how often the Wi-Fi adapter **changes channel**. Packets are captured th
 
 Interactive runs ask after UserID / name / test name. Non-interactive runs take `--hop-rate`. Range is 1–20.
 
-The on-screen GPS/device counter refreshes every 5 seconds. That is status only, not RF sampling.
+While Kismet is up, a full-screen display replaces the scrolling log. The top left is the survey (user ID, operator, test location, GPS fix, hop rate). The top right is the counters (devices found, hops, devices in range) and the radios in use. The bottom half is the ten strongest devices heard on the latest sample, strongest first. The layout follows the terminal size: narrow or short windows drop columns and rows instead of wrapping into a broken frame. Colors follow Omarchy's Tokyo Night palette (navy background, ice text, blue accent) with vaporwave pink and cyan for titles and strong signals. `q` or Ctrl-C stops the capture. `--no-tui` keeps the older status line, which still refreshes every 5 seconds. That line is status only, not RF sampling. The device table updates from the hop poll; the GPS and total-device counters stay on the 5-second poll so a gpsd read cannot stall channel hops.
 
 ## Usage
 
@@ -211,7 +211,7 @@ At start the script:
 7. Asks for **UserID** (e.g. your username or employee ID), **operator name**, and **test name** (e.g. `Warehouse 4 north wing`).
 8. Asks for **channel hop rate** (default `5`).
 9. Unmanages the chosen Wi-Fi interface from NetworkManager and starts Kismet.
-10. Prints GPS / device counts every 5 seconds. Press **Ctrl-C** to stop, or use `--duration`.
+10. Shows the live display (survey, radios, counters, top 10 by signal). Press **q** or **Ctrl-C** to stop, or use `--duration`. `--no-tui` prints GPS / device counts every 5 seconds instead.
 11. Finalizes the `.kismet` log and writes reports, including `ieee_manufacturer`, `mac_kind`, `bt_company`, and `bt_uuids`.
 
 Live UI (localhost only): http://127.0.0.1:2501
@@ -280,6 +280,8 @@ sudo python3 flute.py \
 | `--http-port 2501`                              | Kismet web port (bound to 127.0.0.1)                                     |
 | `--list-only`                                   | Print controllers and GPS, then exit                                     |
 | `--dry-run`                                     | Print the capture plan and exit                                          |
+| `--no-tui`                                      | Status line every 5 seconds instead of the live display                  |
+| `--self-test`                                   | Run the built-in checks and exit (no capture, no install)                |
 
 ## Outputs
 
@@ -346,7 +348,8 @@ The GPL covers copyright of the software. It does **not** authorize wireless col
 Git tracks only the program and its docs:
 
 ```
-flute.py     # setup, checks, Kismet launcher, reports (GPL-3.0-or-later)
+flute.py     # setup, checks, Kismet launcher, live display, reports (GPL-3.0-or-later)
+tests/       # in-process checks (python3 flute.py --self-test)
 README.md
 LICENSE      # GNU GPL v3
 .gitignore
