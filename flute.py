@@ -22,6 +22,10 @@ Portable Linux helper: detects radios and GPS, installs Kismet if needed,
 and runs a receive-only collection. No injection, deauth, association,
 pairing, or credential attacks.
 
+While a capture is running, a full-screen display shows the survey, the
+radios, and the ten strongest devices currently in range. --no-tui keeps
+the 5-second status line. The layout follows the terminal size.
+
 Authorized use only. Typical run:
 
     sudo python3 flute.py --setup
@@ -56,6 +60,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    import curses
+except ImportError:  # pragma: no cover - stripped embedded builds
+    curses = None  # type: ignore[assignment]
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -250,6 +259,19 @@ LIVE_DEVICE_FIELDS = [
 LIVE_DEVICE_FIELDS_BASIC = [
     item for item in LIVE_DEVICE_FIELDS if not str(item[0]).startswith("dot11.")
 ]
+# Names are optional. A Kismet build that rejects them drops back to
+# LIVE_DEVICE_FIELDS, so the SSID columns are kept.
+LIVE_DEVICE_FIELDS_RICH = [
+    *LIVE_DEVICE_FIELDS,
+    ["kismet.device.base.name", "name"],
+    ["kismet.device.base.commonname", "commonname"],
+]
+_LIVE_FIELD_SETS = (
+    LIVE_DEVICE_FIELDS_RICH,
+    LIVE_DEVICE_FIELDS,
+    LIVE_DEVICE_FIELDS_BASIC,
+)
+_live_field_index = 0
 NAME_VENDOR_HINTS = (
     (re.compile(r"govee", re.I), "Govee"),
     (re.compile(r"\[lg\]|webos|\blg\b.*tv", re.I), "LG Electronics"),
@@ -306,6 +328,12 @@ class Colors:
         return f"{color}{text}{cls.RST}"
 
 
+# While the live display owns the terminal, log() keeps the line instead of
+# printing it. The display shows warnings on its footer and replays them
+# after the terminal is restored.
+_log_hook: Any = None
+
+
 def log(msg: str, level: str = "info") -> None:
     palette = {
         "info": Colors.CYN,
@@ -321,6 +349,13 @@ def log(msg: str, level: str = "info") -> None:
         "err": "[-]",
         "hdr": "[#]",
     }.get(level, "[*]")
+    hook = _log_hook
+    if hook is not None:
+        try:
+            hook(msg, level)
+        except Exception:
+            pass
+        return
     print(Colors.wrap(palette.get(level, Colors.CYN), f"{prefix} {msg}"))
 
 
@@ -4575,36 +4610,41 @@ def normalize_live_device(dev: dict[str, Any]) -> dict[str, Any]:
             "kismet.common.signal.max_signal",
         ),
         "ssid": ssid,
+        "name": _plain_field(pick("name", "kismet.device.base.name")),
+        "commonname": _plain_field(pick("commonname", "kismet.device.base.commonname")),
         "tx_power": tx_power,
     }
 
 
-_live_device_fields = LIVE_DEVICE_FIELDS
-
-
 def fetch_recent_devices(client: KismetClient, since_unix: int) -> list[dict[str, Any]]:
     """Devices Kismet has heard since since_unix (absolute epoch seconds)."""
-    global _live_device_fields
+    global _live_field_index
     path = f"/devices/last-time/{max(int(since_unix), 0)}/devices.json"
-
-    def _pull(fields: list[Any]) -> Any:
-        return client.post_json(path, {"fields": fields}, timeout=2.5)
-
-    try:
-        data = _pull(_live_device_fields)
-    except urllib.error.URLError as exc:
-        # Field simplification errors come back as HTTP 4xx/5xx. A timeout
-        # or a refused connection does not, and must not drop the SSID fields.
-        field_error = isinstance(exc, urllib.error.HTTPError) or "POST failed" in str(exc)
-        if field_error and _live_device_fields is not LIVE_DEVICE_FIELDS_BASIC:
-            _live_device_fields = LIVE_DEVICE_FIELDS_BASIC
-            log(
-                "Kismet rejected the SSID fields on the hop poll. "
-                "Continuing with MAC, signal, and channel only.",
-                "warn",
-            )
-            data = _pull(_live_device_fields)
-        else:
+    data: Any = None
+    while True:
+        fields = _LIVE_FIELD_SETS[_live_field_index]
+        try:
+            data = client.post_json(path, {"fields": fields}, timeout=2.5)
+            break
+        except urllib.error.URLError as exc:
+            # Field simplification errors come back as HTTP 4xx/5xx. A timeout
+            # or a refused connection does not, and must not drop the SSID fields.
+            field_error = isinstance(exc, urllib.error.HTTPError) or "POST failed" in str(exc)
+            if field_error and _live_field_index < len(_LIVE_FIELD_SETS) - 1:
+                _live_field_index += 1
+                if _live_field_index == 1:
+                    log(
+                        "Kismet rejected the device-name fields on the hop poll. "
+                        "Continuing without names.",
+                        "warn",
+                    )
+                else:
+                    log(
+                        "Kismet rejected the SSID fields on the hop poll. "
+                        "Continuing with MAC, signal, and channel only.",
+                        "warn",
+                    )
+                continue
             raise
     if isinstance(data, dict):
         for value in data.values():
@@ -4736,8 +4776,934 @@ class HopLog:
         return wrote
 
 
+# Live display. Tokyo Night is the Omarchy palette (navy #1a1b26, ice
+# foreground, blue #7aa2f7). Vaporwave uses that navy and pushes the pink
+# (#ff87d7) and cyan (#87d7ff) forward. 256-color indexes stand in for the
+# hex values; nothing here rewrites the terminal's palette.
+#
+#   bg 234 ~ #1c1c1c     fg 146 ~ #afafd7     pink 212 ~ #ff87d7
+#   cyan 117 ~ #87d7ff   blue 111 ~ #87afff   purple 141 ~ #af87ff
+#   green 150 ~ #afd787  amber 179 ~ #d7af5f  orange 215 ~ #ffaf5f
+#   muted 103 ~ #8787af  dim 60 ~ #5f5f87     raised 236
+_DASH_PAIRS_256 = (
+    ("fg", 146, 234),
+    ("border", 141, 234),
+    ("title", 212, 234),
+    ("accent", 117, 234),
+    ("label", 103, 234),
+    ("header", 111, 234),
+    ("strong", 212, 234),
+    ("mid", 117, 234),
+    ("weak", 103, 234),
+    ("ok", 150, 234),
+    ("warn", 215, 234),
+    ("dim", 60, 234),
+    ("pink", 212, 234),
+)
+_DASH_BOLD = {"title", "header", "strong", "pink"}
+_DASH_STYLES: dict[str, int] = {}
+_DASH_THEME_READY = False
+TOP_DEVICES = 10
+_COL_ALIGN = {
+    "rank": "right",
+    "signal": "right",
+    "dist": "right",
+    "phy": "left",
+    "ch": "right",
+    "device": "left",
+}
+
+
+@dataclass(frozen=True)
+class Span:
+    text: str
+    style: str = "fg"
+
+
+@dataclass
+class DashboardView:
+    """One frame of the live survey. `devices` is already strongest-first."""
+
+    userid: str = ""
+    operator_name: str = ""
+    test_name: str = ""
+    host: str = ""
+    gps_text: str = ""
+    started: str = ""
+    elapsed_s: int = 0
+    duration_s: int | None = None
+    hop_rate: int = DEFAULT_HOP_RATE
+    outdir: str = ""
+    kismet_version: str = ""
+    http_port: int = 0
+    devices_found: int = 0
+    in_range: int = 0
+    hops: int = 0
+    hop_rows: int = 0
+    packets: int = 0
+    phys_text: str = ""
+    wifi_iface: str = ""
+    wifi_source_type: str = ""
+    wifi_hint: str = ""
+    wifi_mac: str = ""
+    wifi_driver: str = ""
+    wifi_usb: str = ""
+    bluetooth: str = ""
+    gps_device: str = ""
+    devices: list[dict[str, Any]] = field(default_factory=list)
+    message: str = ""
+    poll_ok: bool = True
+
+
+def _pairs_16() -> tuple[tuple[str, int, int], ...]:
+    c = curses
+    return (
+        ("fg", c.COLOR_WHITE, c.COLOR_BLACK),
+        ("border", c.COLOR_MAGENTA, c.COLOR_BLACK),
+        ("title", c.COLOR_MAGENTA, c.COLOR_BLACK),
+        ("accent", c.COLOR_CYAN, c.COLOR_BLACK),
+        ("label", c.COLOR_BLUE, c.COLOR_BLACK),
+        ("header", c.COLOR_BLUE, c.COLOR_BLACK),
+        ("strong", c.COLOR_MAGENTA, c.COLOR_BLACK),
+        ("mid", c.COLOR_CYAN, c.COLOR_BLACK),
+        ("weak", c.COLOR_BLUE, c.COLOR_BLACK),
+        ("ok", c.COLOR_GREEN, c.COLOR_BLACK),
+        ("warn", c.COLOR_YELLOW, c.COLOR_BLACK),
+        ("dim", c.COLOR_WHITE, c.COLOR_BLACK),
+        ("pink", c.COLOR_MAGENTA, c.COLOR_BLACK),
+    )
+
+
+def _load_dash_pairs(pairs: tuple[tuple[str, int, int], ...]) -> None:
+    _DASH_STYLES.clear()
+    for index, (name, fg, bg) in enumerate(pairs, start=1):
+        curses.init_pair(index, fg, bg)
+        _DASH_STYLES[name] = curses.color_pair(index)
+
+
+def init_dashboard_theme() -> None:
+    """Map style names to curses attributes. Safe to call more than once."""
+    global _DASH_THEME_READY
+    if curses is None:
+        return
+    if _DASH_THEME_READY:
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+    if curses.has_colors() and curses.COLORS >= 256:
+        try:
+            _load_dash_pairs(_DASH_PAIRS_256)
+            _DASH_THEME_READY = True
+            return
+        except curses.error:
+            _DASH_STYLES.clear()
+    if curses.has_colors():
+        try:
+            _load_dash_pairs(_pairs_16())
+            _DASH_THEME_READY = True
+            return
+        except curses.error:
+            _DASH_STYLES.clear()
+    _DASH_STYLES["fg"] = curses.A_NORMAL
+    _DASH_THEME_READY = True
+
+
+def dashboard_attr(name: str) -> int:
+    if curses is None:
+        return 0
+    attr = _DASH_STYLES.get(name, _DASH_STYLES.get("fg", curses.A_NORMAL))
+    if name in _DASH_BOLD:
+        attr |= curses.A_BOLD
+    if name == "dim":
+        attr |= curses.A_DIM
+    return attr
+
+
+def clip_text(text: str, width: int) -> str:
+    cleaned: list[str] = []
+    for ch in str(text):
+        if ch in "\n\r\t":
+            cleaned.append(" ")
+        elif ch.isprintable():
+            cleaned.append(ch)
+    flat = "".join(cleaned)
+    if width <= 0:
+        return ""
+    if len(flat) <= width:
+        return flat
+    if width == 1:
+        return "…"
+    return flat[: width - 1] + "…"
+
+
+def fit_cell(text: str, width: int, align: str = "left") -> str:
+    if width <= 0:
+        return ""
+    shown = clip_text(text, width)
+    if len(shown) >= width:
+        return shown[:width]
+    pad = " " * (width - len(shown))
+    if align == "right":
+        return pad + shown
+    return shown + pad
+
+
+def fit_spans(spans: list[Span], width: int) -> list[Span]:
+    """Clip or pad so the row is exactly `width` columns."""
+    if width <= 0:
+        return []
+    out: list[Span] = []
+    used = 0
+    for span in spans:
+        if used >= width or not span.text:
+            continue
+        room = width - used
+        text = span.text if len(span.text) <= room else span.text[:room]
+        out.append(Span(text, span.style))
+        used += len(text)
+    if used < width:
+        out.append(Span(" " * (width - used), "fg"))
+    return out
+
+
+def as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def format_elapsed(seconds: int) -> str:
+    seconds = max(0, as_int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def short_stamp(value: str) -> str:
+    text = str(value or "").replace("T", " ")
+    if text.endswith("+00:00"):
+        text = text[:-6] + "Z"
+    return text
+
+
+def format_gps_status(gps: dict[str, Any]) -> str:
+    """Same wording as the text status line."""
+    if gps.get("valid"):
+        return f"{gps['lat']:.6f},{gps['lon']:.6f} fix={gps.get('fix') or '3D'}"
+    if gps.get("sats"):
+        return f"searching ({gps['sats']} sats; window/sky)"
+    if gps.get("connected"):
+        return "receiver up, 0 sats (place puck by a window; wait 1–5 min)"
+    return "not connected"
+
+
+def format_phy_status(info: dict[str, Any]) -> str:
+    phys = info.get("phys") or {}
+    return ", ".join(f"{k}={v}" for k, v in phys.items()) or f"total={info.get('devices')}"
+
+
+def gps_style(text: str) -> str:
+    if "fix=" in text:
+        return "ok"
+    if text.startswith("searching") or text.startswith("receiver"):
+        return "warn"
+    return "dim"
+
+
+def signal_sort_value(value: Any) -> float | None:
+    text = format_dbm(value)
+    if not text:
+        return None
+    return float(text)
+
+
+def signal_style(value: Any) -> str:
+    rssi = signal_sort_value(value)
+    if rssi is None:
+        return "dim"
+    if rssi >= -50:
+        return "strong"
+    if rssi >= -70:
+        return "mid"
+    if rssi >= -85:
+        return "accent"
+    return "weak"
+
+
+def short_phy(phy: str) -> str:
+    text = (phy or "").lower()
+    if not text:
+        return "—"
+    if "br/edr" in text or "bredr" in text or "classic" in text:
+        return "bt"
+    if "btle" in text or text in {"le", "ble"}:
+        return "ble"
+    if "blue" in text:
+        return "bt"
+    if any(tok in text for tok in ("802", "dot11", "wifi", "wi-fi")):
+        return "wifi"
+    return phy
+
+
+def live_device_label(dev: dict[str, Any]) -> str:
+    mac = str(dev.get("mac") or "").upper()
+    names: list[str] = []
+    for key in ("ssid", "name", "commonname"):
+        text = str(dev.get(key) or "").strip()
+        if not text or text.upper() == mac or text in names:
+            continue
+        names.append(text)
+    label = "  ".join(names)
+    if label and mac:
+        return f"{label}  {mac}"
+    return label or mac or "—"
+
+
+def device_distance_text(dev: dict[str, Any]) -> str:
+    phy = str(dev.get("phy") or "")
+    dtype = str(dev.get("type") or "")
+    ssid = str(dev.get("ssid") or "")
+    freq = frequency_mhz_for_range(dev.get("frequency"), dev.get("channel"), phy)
+    tx = resolve_tx_dbm(phy, dtype, ssid, dev.get("tx_power"))
+    signal_text = format_dbm(dev.get("signal"))
+    if not signal_text:
+        return ""
+    return format_distance(estimate_distance_m(signal_text, freq, tx))
+
+
+def rank_in_range(devices: list[dict[str, Any]], limit: int = TOP_DEVICES) -> list[dict[str, Any]]:
+    """Strongest last-heard signal first. Missing dBm sorts last. One row per MAC."""
+    best: dict[str, dict[str, Any]] = {}
+    for dev in devices:
+        mac = str(dev.get("mac") or "").upper()
+        if not mac:
+            continue
+        rssi = signal_sort_value(dev.get("signal"))
+        current = best.get(mac)
+        if current is None or (
+            rssi is not None and (current.get("_rssi") is None or rssi > current["_rssi"])
+        ):
+            chosen = dict(dev)
+            chosen["mac"] = mac
+            chosen["_rssi"] = rssi
+            best[mac] = chosen
+    ranked = sorted(
+        best.values(),
+        key=lambda item: (
+            item.get("_rssi") is None,
+            -(item["_rssi"] if item.get("_rssi") is not None else 0.0),
+            item["mac"],
+        ),
+    )
+    cap = max(0, int(limit))
+    chosen = ranked[:cap]
+    for item in chosen:
+        item.pop("_rssi", None)
+    return chosen
+
+
+def layout_columns(width: int) -> list[tuple[str, int, str]]:
+    """Column widths that add up to `width`, including one space between columns."""
+    if width <= 0:
+        return []
+    preferred = [
+        ("rank", 3, "#"),
+        ("signal", 5, "dBm"),
+        ("dist", 7, "range"),
+        ("phy", 4, "phy"),
+        ("ch", 4, "ch"),
+        ("device", 8, "device"),
+    ]
+
+    def cost(items: list[tuple[str, int, str]]) -> int:
+        if not items:
+            return 0
+        return sum(col_w for _, col_w, _ in items) + len(items) - 1
+
+    items = list(preferred)
+    for key in ("ch", "phy", "dist", "signal", "rank"):
+        if cost(items) <= width:
+            break
+        items = [item for item in items if item[0] != key]
+    if not items or cost(items) > width:
+        return [("device", width, "device")]
+    extra = width - cost(items)
+    grown: list[tuple[str, int, str]] = []
+    for key, col_w, header in items:
+        if key == "device":
+            col_w += extra
+        grown.append((key, col_w, header))
+    return grown
+
+
+def kv_spans(
+    label: str,
+    value: str,
+    width: int,
+    value_style: str = "fg",
+    align: str = "left",
+) -> list[Span]:
+    if width <= 0:
+        return []
+    label = label.strip()
+    value = str(value or "")
+    if not label and not value:
+        return [Span(" " * width, "fg")]
+    if not value:
+        return [Span(fit_cell(label, width), value_style)]
+    if not label or width <= len(label):
+        return [Span(fit_cell(f"{label} {value}".strip(), width, align), value_style)]
+    value_w = width - len(label) - 1
+    return fit_spans(
+        [
+            Span(label, "label"),
+            Span(" ", "fg"),
+            Span(fit_cell(value, value_w, align), value_style),
+        ],
+        width,
+    )
+
+
+def indented_kv(
+    label: str,
+    value: str,
+    width: int,
+    value_style: str = "fg",
+    align: str = "left",
+) -> list[Span]:
+    """One leading space and one trailing space, so text does not touch the box."""
+    if width <= 0:
+        return []
+    if width <= 2:
+        return [Span(" " * width, "fg")]
+    return fit_spans(
+        [
+            Span(" ", "fg"),
+            *kv_spans(label, value, width - 2, value_style, align),
+            Span(" ", "fg"),
+        ],
+        width,
+    )
+
+
+def bar_spans(inner: int, title: str, title_style: str = "title") -> list[Span]:
+    if inner <= 0:
+        return []
+    title = " ".join(str(title or "").split())
+    if not title:
+        return [Span("─" * inner, "border")]
+    label = f" {title} "
+    if len(label) > inner:
+        # Keep a dash in front of a clipped title so it does not sit on the corner.
+        if inner == 1:
+            return [Span(clip_text(title, 1), title_style)]
+        shown = clip_text(title, inner - 1)
+        return [Span("─", "border"), Span(shown, title_style)]
+    pad = inner - len(label)
+    left = pad // 2
+    right = pad - left
+    parts: list[Span] = []
+    if left:
+        parts.append(Span("─" * left, "border"))
+    parts.append(Span(label, title_style))
+    if right:
+        parts.append(Span("─" * right, "border"))
+    return parts
+
+
+def boxed(inner: list[Span], cols: int) -> list[Span]:
+    inner_w = max(0, cols - 2)
+    return fit_spans(
+        [Span("│", "border"), *fit_spans(inner, inner_w), Span("│", "border")],
+        cols,
+    )
+
+
+def split_boxed(
+    left: list[Span],
+    right: list[Span],
+    cols: int,
+    split_at: int,
+) -> list[Span]:
+    left_w = max(0, split_at - 1)
+    right_w = max(0, cols - split_at - 2)
+    return fit_spans(
+        [
+            Span("│", "border"),
+            *fit_spans(left, left_w),
+            Span("│", "border"),
+            *fit_spans(right, right_w),
+            Span("│", "border"),
+        ],
+        cols,
+    )
+
+
+def panel_split(cols: int) -> int:
+    split_at = int(round(cols * 0.46))
+    return min(max(split_at, 2), max(2, cols - 3))
+
+
+def scan_rows(view: DashboardView) -> list[tuple[str, str, str, str]]:
+    elapsed = format_elapsed(view.elapsed_s)
+    if view.duration_s:
+        clock = f"{elapsed}   left {format_elapsed(max(view.duration_s - view.elapsed_s, 0))}"
+    else:
+        clock = f"{elapsed}   until ctrl-c"
+    operator = view.operator_name or "—"
+    if view.host:
+        operator = f"{operator}   ·   {view.host}"
+    ui = f"127.0.0.1:{view.http_port}" if view.http_port else ""
+    return [
+        ("User ID", view.userid or "—", "accent", "left"),
+        ("Location", view.test_name or "—", "accent", "left"),
+        ("GPS", view.gps_text or "not connected", gps_style(view.gps_text or ""), "left"),
+        ("Operator", operator, "fg", "left"),
+        ("Elapsed", clock, "fg", "left"),
+        ("Hop rate", f"{view.hop_rate}/sec   {hop_dwell_ms(view.hop_rate)} ms/channel", "fg", "left"),
+        ("Started", short_stamp(view.started) or "—", "dim", "left"),
+        ("UI", ui or "—", "dim", "left"),
+        ("Output", view.outdir or "—", "dim", "left"),
+        ("Kismet", view.kismet_version or "—", "dim", "left"),
+    ]
+
+
+def hardware_lines(view: DashboardView) -> list[tuple[str, str, str, str]]:
+    wifi = " ".join(
+        part
+        for part in (
+            view.wifi_iface,
+            f"({view.wifi_source_type})" if view.wifi_source_type else "",
+            view.wifi_usb,
+            view.wifi_mac,
+        )
+        if part
+    )
+    radio_bits: list[str] = []
+    for part in (view.wifi_hint, view.wifi_driver):
+        text = str(part or "").strip()
+        if text and text not in radio_bits:
+            radio_bits.append(text)
+    return [
+        ("Wi-Fi", wifi or "—", "accent", "left"),
+        ("Radio", "  ".join(radio_bits) or "—", "fg", "left"),
+        ("Bluetooth", view.bluetooth or "—", "accent", "left"),
+        ("GPS hw", view.gps_device or "—", "fg", "left"),
+    ]
+
+
+def counter_lines(view: DashboardView) -> list[tuple[str, str, str, str]]:
+    return [
+        ("Devices", str(view.devices_found), "title", "right"),
+        ("Hops", str(view.hops), "title", "right"),
+        ("In range", str(view.in_range), "accent", "right"),
+        ("Hop rows", str(view.hop_rows), "fg", "right"),
+        ("Packets", str(view.packets), "fg", "right"),
+        ("Phys", view.phys_text or "—", "fg", "left"),
+    ]
+
+
+def fit_stat_rows(
+    slots: int,
+    counters: list[tuple[str, str, str, str]],
+    hardware: list[tuple[str, str, str, str]],
+) -> list[tuple[str, str, str, str]]:
+    """Devices, hops, and in-range stay; leftover rows describe the radios."""
+    if slots <= 0:
+        return []
+    if slots >= len(counters) + len(hardware):
+        return counters + hardware
+    if slots <= 3:
+        return counters[:slots]
+    hw_n = min(len(hardware), slots - 3)
+    ctr_n = slots - hw_n
+    if ctr_n > len(counters):
+        ctr_n = len(counters)
+        hw_n = min(len(hardware), slots - ctr_n)
+    return counters[:ctr_n] + hardware[:hw_n]
+
+
+def column_spans(
+    columns: list[tuple[str, int, str]],
+    values: dict[str, tuple[str, str]],
+) -> list[Span]:
+    spans: list[Span] = []
+    for index, (key, col_w, _header) in enumerate(columns):
+        if index:
+            spans.append(Span(" ", "dim"))
+        text, style = values[key]
+        spans.append(Span(fit_cell(text, col_w, _COL_ALIGN.get(key, "left")), style))
+    return spans
+
+
+def device_table_spans(dev: dict[str, Any], rank: int, width: int) -> list[Span]:
+    columns = layout_columns(width)
+    if not columns:
+        return []
+    dist = device_distance_text(dev)
+    values = {
+        "rank": (str(rank), "title" if rank == 1 else "dim"),
+        "signal": (format_dbm(dev.get("signal")) or "—", signal_style(dev.get("signal"))),
+        "dist": (f"{dist}m" if dist else "—", "dim"),
+        "phy": (short_phy(str(dev.get("phy") or "")), "accent"),
+        "ch": (str(dev.get("channel") or "").strip() or "—", "fg"),
+        "device": (live_device_label(dev), "fg"),
+    }
+    return fit_spans(column_spans(columns, values), width)
+
+
+def header_spans(width: int) -> list[Span]:
+    columns = layout_columns(width)
+    values = {key: (header, "header") for key, _col_w, header in columns}
+    return fit_spans(column_spans(columns, values), width)
+
+
+def top_border(cols: int, split_at: int) -> list[Span]:
+    return fit_spans(
+        [
+            Span("╭", "border"),
+            *bar_spans(max(0, split_at - 1), "THE MAGIC FLUTE"),
+            Span("┬", "border"),
+            *bar_spans(max(0, cols - split_at - 2), "STATS"),
+            Span("╮", "border"),
+        ],
+        cols,
+    )
+
+
+def mid_border(cols: int, split_at: int, left_title: str, right_title: str) -> list[Span]:
+    left_style = "warn" if left_title else "border"
+    return fit_spans(
+        [
+            Span("├", "border"),
+            *bar_spans(max(0, split_at - 1), left_title, left_style),
+            Span("┴", "border"),
+            *bar_spans(max(0, cols - split_at - 2), right_title, "title"),
+            Span("┤", "border"),
+        ],
+        cols,
+    )
+
+
+def bottom_border(cols: int, hint: str, style: str) -> list[Span]:
+    return fit_spans(
+        [
+            Span("╰", "border"),
+            *bar_spans(max(0, cols - 2), hint, style),
+            Span("╯", "border"),
+        ],
+        cols,
+    )
+
+
+def render_compact(view: DashboardView, rows: int, cols: int) -> list[list[Span]]:
+    lines: list[tuple[str, str]] = [
+        ("THE MAGIC FLUTE", "title"),
+        (f"{view.userid}  {view.test_name}".strip() or "survey", "accent"),
+        (
+            f"hops {view.hops}  found {view.devices_found}  range {view.in_range}",
+            "fg",
+        ),
+        (
+            "  ".join(
+                part
+                for part in (view.wifi_iface, view.wifi_hint, view.bluetooth, view.gps_device)
+                if part
+            )
+            or "no radio selected",
+            "accent",
+        ),
+        (view.gps_text or "gps not connected", gps_style(view.gps_text or "")),
+    ]
+    for index, dev in enumerate(view.devices[:TOP_DEVICES], start=1):
+        sig = format_dbm(dev.get("signal")) or "—"
+        lines.append((f"{index} {sig} {live_device_label(dev)}", signal_style(dev.get("signal"))))
+    if view.message:
+        lines.append((view.message, "warn"))
+    frame = [
+        fit_spans([Span(clip_text(text, cols), style)], cols)
+        for text, style in lines[:rows]
+    ]
+    while len(frame) < rows:
+        frame.append(fit_spans([], cols))
+    return frame
+
+
+def render_split(view: DashboardView, rows: int, cols: int) -> list[list[Span]]:
+    """Top half is scan | stats. Bottom half is the current top 10."""
+    mid = rows // 2
+    body_h = mid - 2
+    device_h = rows - mid - 2
+    split_at = panel_split(cols)
+    left_w = max(0, split_at - 1)
+    right_w = max(0, cols - split_at - 2)
+    inner_w = max(0, cols - 2)
+    scans = scan_rows(view)[:body_h]
+    stats = fit_stat_rows(body_h, counter_lines(view), hardware_lines(view))
+    frame: list[list[Span]] = [fit_spans([], cols) for _ in range(rows)]
+    frame[0] = top_border(cols, split_at)
+    for index in range(body_h):
+        left = scans[index] if index < len(scans) else ("", "", "fg", "left")
+        right = stats[index] if index < len(stats) else ("", "", "fg", "left")
+        frame[1 + index] = split_boxed(
+            indented_kv(left[0], left[1], left_w, left[2], left[3]),
+            indented_kv(right[0], right[1], right_w, right[2], right[3]),
+            cols,
+            split_at,
+        )
+    if view.in_range > TOP_DEVICES:
+        section = f"IN RANGE  ·  TOP {TOP_DEVICES} OF {view.in_range} BY SIGNAL"
+    else:
+        section = f"IN RANGE  ·  TOP {TOP_DEVICES} BY SIGNAL"
+    held = "" if view.poll_ok else "HOLDING LAST SAMPLE"
+    frame[mid - 1] = mid_border(cols, split_at, held, section)
+    frame[mid] = boxed(header_spans(inner_w), cols)
+    shown = view.devices[:TOP_DEVICES]
+    for index in range(device_h):
+        if index < len(shown):
+            inner = device_table_spans(shown[index], index + 1, inner_w)
+        elif index == 0:
+            note = (
+                " holding last sample — no devices yet"
+                if not view.poll_ok
+                else " listening — no devices in range on the last sample"
+            )
+            inner = [Span(clip_text(note, inner_w), "dim")]
+        else:
+            inner = []
+        frame[mid + 1 + index] = boxed(inner, cols)
+    hint = view.message or "ctrl-c or q stops   ·   receive only   ·   tokyo night"
+    frame[rows - 1] = bottom_border(cols, hint, "warn" if view.message else "dim")
+    return frame
+
+
+def seal_frame(frame: list[list[Span]], rows: int, cols: int) -> list[list[Span]]:
+    sealed = [fit_spans(row, cols) for row in frame[:rows]]
+    while len(sealed) < rows:
+        sealed.append(fit_spans([], cols))
+    return sealed
+
+
+def render_dashboard(view: DashboardView, rows: int, cols: int) -> list[list[Span]]:
+    """A full frame. Every row is exactly `cols` columns, and there are `rows` of them."""
+    rows = int(rows)
+    cols = int(cols)
+    if rows < 1 or cols < 1:
+        return []
+    full = False
+    if rows >= 10 and cols >= 36:
+        mid = rows // 2
+        if mid - 2 >= 1 and rows - mid - 2 >= 1:
+            full = True
+    if full:
+        frame = render_split(view, rows, cols)
+    else:
+        frame = render_compact(view, rows, cols)
+    return seal_frame(frame, rows, cols)
+
+
+def frame_text(view: DashboardView, rows: int, cols: int) -> list[str]:
+    return ["".join(span.text for span in row) for row in render_dashboard(view, rows, cols)]
+
+
+def paint_dashboard(stdscr: Any, view: DashboardView, rows: int | None = None, cols: int | None = None) -> None:
+    if curses is None or stdscr is None:
+        return
+    if rows is None or cols is None:
+        rows, cols = stdscr.getmaxyx()
+    rows = int(rows)
+    cols = int(cols)
+    if rows < 1 or cols < 1:
+        return
+    frame = render_dashboard(view, rows, cols)
+    for y, spans in enumerate(frame):
+        if y >= rows:
+            break
+        # The lower-right cell is not writable.
+        limit = cols - 1 if y == rows - 1 else cols
+        x = 0
+        for span in spans:
+            if x >= limit:
+                break
+            text = span.text
+            room = limit - x
+            if len(text) > room:
+                text = text[:room]
+            if not text:
+                continue
+            try:
+                stdscr.addstr(y, x, text, dashboard_attr(span.style))
+            except curses.error:
+                break
+            x += len(text)
+
+
+class DashboardScreen:
+    """Curses owner for one capture. Drawing never touches the hop log."""
+
+    def __init__(
+        self,
+        survey: dict[str, Any],
+        duration: int | None = None,
+        hop_rate: int = DEFAULT_HOP_RATE,
+    ) -> None:
+        self.survey = survey or {}
+        self.duration = duration
+        self.hop_rate = hop_rate or as_int(self.survey.get("hop_rate")) or DEFAULT_HOP_RATE
+        self.heard: list[dict[str, Any]] = []
+        self.poll_ok = True
+        self.unique: set[str] = set()
+        self.counts: dict[str, Any] = {}
+        self.message = ""
+        self.replay: list[tuple[str, str]] = []
+        self.stdscr: Any = None
+
+    def open(self) -> bool:
+        if curses is None or not sys.stdout.isatty():
+            return False
+        try:
+            self.stdscr = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            self.stdscr.keypad(True)
+            self.stdscr.nodelay(True)
+            init_dashboard_theme()
+            self.stdscr.bkgd(" ", dashboard_attr("fg"))
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def close(self) -> None:
+        screen = self.stdscr
+        self.stdscr = None
+        if curses is None or screen is None:
+            return
+        try:
+            curses.nocbreak()
+            screen.keypad(False)
+            curses.echo()
+            curses.endwin()
+        except curses.error:
+            pass
+
+    def note_log(self, msg: str, level: str) -> None:
+        if level in {"warn", "err", "ok"}:
+            self.replay.append((level, msg))
+        if level in {"warn", "err"}:
+            self.message = msg
+
+    def note_counts(self, counts: dict[str, Any]) -> None:
+        self.counts = counts or {}
+
+    def note_heard(self, devices: list[dict[str, Any]] | None, ok: bool) -> None:
+        if not ok:
+            self.poll_ok = False
+            return
+        self.poll_ok = True
+        self.heard = list(devices or [])
+        for dev in self.heard:
+            mac = str(dev.get("mac") or "").upper()
+            if mac:
+                self.unique.add(mac)
+
+    def poll_quit(self) -> bool:
+        if self.stdscr is None:
+            return False
+        try:
+            while True:
+                key = self.stdscr.getch()
+                if key == -1:
+                    return False
+                if key in (ord("q"), ord("Q")):
+                    return True
+        except curses.error:
+            return False
+
+    def make_view(self, elapsed_s: int, hops: int, hop_rows: int) -> DashboardView:
+        survey = self.survey
+        gps = (self.counts.get("gps") or {}) if self.counts else {}
+        found = max(as_int(self.counts.get("devices")), len(self.unique))
+        in_range = len({str(dev.get("mac") or "").upper() for dev in self.heard if dev.get("mac")})
+        packets = self.counts.get("packets", 0)
+        try:
+            packets_n = int(packets)
+        except (TypeError, ValueError):
+            packets_n = 0
+        return DashboardView(
+            userid=str(survey.get("userid") or ""),
+            operator_name=str(survey.get("operator_name") or ""),
+            test_name=str(survey.get("test_name") or ""),
+            host=str(survey.get("host") or ""),
+            gps_text=format_gps_status(gps) if self.counts else "not connected",
+            started=str(survey.get("started") or ""),
+            elapsed_s=max(0, as_int(elapsed_s)),
+            duration_s=self.duration,
+            hop_rate=self.hop_rate,
+            outdir=str(survey.get("outdir") or ""),
+            kismet_version=str(survey.get("kismet_version") or ""),
+            http_port=as_int(survey.get("http_port")),
+            devices_found=found,
+            in_range=in_range,
+            hops=hops,
+            hop_rows=hop_rows,
+            packets=packets_n,
+            phys_text=format_phy_status(self.counts) if self.counts else "",
+            wifi_iface=str(survey.get("wifi_iface") or ""),
+            wifi_source_type=str(survey.get("wifi_source_type") or ""),
+            wifi_hint=str(survey.get("wifi_hint") or ""),
+            wifi_mac=str(survey.get("wifi_mac") or ""),
+            wifi_driver=str(survey.get("wifi_driver") or ""),
+            wifi_usb=str(survey.get("wifi_usb") or ""),
+            bluetooth=str(survey.get("bluetooth") or ""),
+            gps_device=str(survey.get("gps_device") or ""),
+            devices=rank_in_range(self.heard, TOP_DEVICES),
+            message=self.message,
+            poll_ok=self.poll_ok,
+        )
+
+    def paint(self, elapsed_s: int, hops: int, hop_rows: int) -> None:
+        if self.stdscr is None:
+            return
+        try:
+            rows, cols = self.stdscr.getmaxyx()
+            self.stdscr.erase()
+            paint_dashboard(self.stdscr, self.make_view(elapsed_s, hops, hop_rows), rows, cols)
+            self.stdscr.noutrefresh()
+            curses.doupdate()
+        except curses.error:
+            return
+
+
 def _raise_keyboard_interrupt(signum: int, frame: Any) -> None:
     raise KeyboardInterrupt
+
+
+def _status_line(
+    elapsed: int,
+    info: dict[str, Any],
+    duration: int | None,
+    hop_log: HopLog | None,
+) -> str:
+    gps_s = format_gps_status(info.get("gps") or {})
+    phy_s = format_phy_status(info)
+    remain = ""
+    if duration is not None:
+        remain = f"  remaining={max(duration - elapsed, 0)}s"
+    hop_s = ""
+    if hop_log is not None:
+        hop_s = f"  hop={hop_log.hop} logged={hop_log.rows}"
+    return f"t={elapsed}s  GPS {gps_s}  devices {phy_s}{hop_s}{remain}"
 
 
 def capture_loop(
@@ -4746,25 +5712,60 @@ def capture_loop(
     duration: int | None,
     hop_log: HopLog | None = None,
     hop_rate: int = DEFAULT_HOP_RATE,
+    survey: dict[str, Any] | None = None,
+    use_tui: bool | None = None,
 ) -> None:
+    global _log_hook
     started = time.time()
     interval = 1.0 / max(int(hop_rate), 1)
     next_status = 0.0
     next_hop = time.monotonic()
+    next_paint = 0.0
     # Overlap the "seen since" query by a few seconds. Kismet's last-heard
     # time is whole seconds, and a strict cutoff drops a packet that lands
     # on the boundary. Unchanged devices are not written twice.
     since_ts = int(started) - 4
-    log("Capture running. Press Ctrl-C to stop." + (f" Duration={duration}s." if duration else ""))
-    log("Kismet web UI: http://127.0.0.1:2501 (local only)")
-    if hop_log is not None:
-        log(
-            f"Hop log records a device when its packets, signal, or "
-            f"last-heard time change ({hop_rate} samples/sec) and syncs "
-            f"those rows. Quiet samples increment hop and add no rows."
-        )
+    dashboard: DashboardScreen | None = None
+    active = False
+    # Totals still come from the same 5-second poll as the text line.
+    # gpsd can block inside that poll; calling it on every hop would stall
+    # the sample clock. The device table updates from the hop poll itself.
     old_term = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
+        wants_tui = use_tui is not False and curses is not None and sys.stdout.isatty()
+        if wants_tui:
+            dashboard = DashboardScreen(survey or {}, duration=duration, hop_rate=hop_rate)
+            active = dashboard.open()
+            if active:
+                _log_hook = dashboard.note_log
+                try:
+                    dashboard.paint(0, 0, 0)
+                except Exception as exc:
+                    active = False
+                    _log_hook = None
+                    dashboard.close()
+                    log(
+                        f"Live display stopped ({exc}). Status lines continue.",
+                        "warn",
+                    )
+            else:
+                dashboard.close()
+                dashboard = None
+                log(
+                    "Live display could not start. Printing a status line every 5 seconds.",
+                    "warn",
+                )
+        log(
+            "Capture running. Press Ctrl-C to stop."
+            + (f" Duration={duration}s." if duration else "")
+        )
+        log("Kismet web UI: http://127.0.0.1:2501 (local only)")
+        if hop_log is not None:
+            log(
+                f"Hop log records a device when its packets, signal, or "
+                f"last-heard time change ({hop_rate} samples/sec) and syncs "
+                f"those rows. Quiet samples increment hop and add no rows."
+            )
         while True:
             if proc.poll() is not None:
                 log(f"Kismet exited early with code {proc.returncode}.", "err")
@@ -4778,38 +5779,55 @@ def capture_loop(
                 try:
                     heard = fetch_recent_devices(client, since_ts)
                     hop_log.append_sample(heard)
+                    if active and dashboard is not None:
+                        dashboard.note_heard(heard, True)
                     since_ts = int(time.time()) - 4
                 except Exception as exc:
                     hop_log.note_error(exc)
+                    if active and dashboard is not None:
+                        dashboard.note_heard(None, False)
                     since_ts = int(time.time()) - 4
                 next_hop = time.monotonic() + interval
             if now >= next_status:
-                info = live_counts(client)
-                gps = info.get("gps") or {}
-                if gps.get("valid"):
-                    gps_s = f"{gps['lat']:.6f},{gps['lon']:.6f} fix={gps.get('fix') or '3D'}"
-                elif gps.get("sats"):
-                    gps_s = f"searching ({gps['sats']} sats; window/sky)"
-                elif gps.get("connected"):
-                    gps_s = "receiver up, 0 sats (place puck by a window; wait 1–5 min)"
+                try:
+                    info = live_counts(client)
+                except Exception as exc:
+                    info = {}
+                    log(f"Status poll failed ({exc}).", "warn")
+                if active and dashboard is not None:
+                    dashboard.note_counts(info)
                 else:
-                    gps_s = "not connected"
-                phys = info.get("phys") or {}
-                phy_s = ", ".join(f"{k}={v}" for k, v in phys.items()) or f"total={info.get('devices')}"
-                remain = ""
-                if duration is not None:
-                    remain = f"  remaining={max(duration - elapsed, 0)}s"
-                hop_s = ""
-                if hop_log is not None:
-                    hop_s = f"  hop={hop_log.hop} logged={hop_log.rows}"
-                log(f"t={elapsed}s  GPS {gps_s}  devices {phy_s}{hop_s}{remain}")
+                    log(_status_line(elapsed, info, duration, hop_log))
                 next_status = now + 5
+            if active and dashboard is not None and time.monotonic() >= next_paint:
+                try:
+                    hops = hop_log.hop if hop_log is not None else 0
+                    hop_rows = hop_log.rows if hop_log is not None else 0
+                    dashboard.paint(elapsed, hops, hop_rows)
+                except Exception as exc:
+                    active = False
+                    _log_hook = None
+                    dashboard.close()
+                    log(
+                        f"Live display stopped ({exc}). Status lines continue.",
+                        "warn",
+                    )
+                next_paint = time.monotonic() + 0.1
+            if active and dashboard is not None and dashboard.poll_quit():
+                raise KeyboardInterrupt
             time.sleep(min(0.05, interval / 2))
     except KeyboardInterrupt:
-        print()
+        if _log_hook is None:
+            print()
         log("Stop requested.", "warn")
     finally:
+        pending = list(dashboard.replay) if dashboard is not None else []
+        _log_hook = None
+        if dashboard is not None:
+            dashboard.close()
         signal.signal(signal.SIGTERM, old_term)
+        for level, msg in pending:
+            log(msg, level)
 
 
 def reprocess_outdir(outdir: Path, ieee_policy: str) -> int:
@@ -4938,6 +5956,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-only", action="store_true", help="List controllers and GPS, then exit")
     p.add_argument("--dry-run", action="store_true", help="Show the Kismet command and exit")
     p.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="Print a status line every 5 seconds instead of the live display",
+    )
+    p.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run the built-in checks and exit (no capture, no install)",
+    )
+    p.add_argument(
         "--report-from",
         default="",
         metavar="DIR",
@@ -4949,8 +5977,30 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def run_self_test() -> int:
+    """Run the in-tree checks. No Kismet, no install, no capture."""
+    import importlib.util
+    import unittest
+
+    path = Path(__file__).resolve().parent / "tests" / "test_live_dashboard.py"
+    if not path.is_file():
+        log(f"Missing {path}", "err")
+        return 1
+    spec = importlib.util.spec_from_file_location("test_live_dashboard", path)
+    if spec is None or spec.loader is None:
+        log(f"Could not load {path}", "err")
+        return 1
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
 def main() -> int:
     args = build_parser().parse_args()
+    if args.self_test:
+        return run_self_test()
     print_banner()
     if args.no_download_ieee:
         ieee_policy = "no"
@@ -5344,12 +6394,37 @@ def main() -> int:
             log(f"Kismet is up (pid {proc.pid}). Web UI http://127.0.0.1:{http_port}", "ok")
             hop_log = HopLog(outdir / HOP_LOG_NAME)
             log(f"Hop log synced each hop: {hop_log.path}", "ok")
+            survey = {
+                "userid": userid,
+                "operator_name": operator_name,
+                "test_name": test_name,
+                "host": session.get("host") or socket.gethostname(),
+                "started": session.get("generated_start") or "",
+                "wifi_iface": str(wifi.get("iface") or ""),
+                "wifi_source_type": str(wifi.get("source_type") or "linuxwifi"),
+                "wifi_hint": str(wifi.get("hint") or ""),
+                "wifi_mac": str(wifi.get("mac") or ""),
+                "wifi_driver": str(wifi.get("driver") or ""),
+                "wifi_usb": str(wifi.get("usb") or ""),
+                "bluetooth": ", ".join(bt_ifaces) if bt_ifaces else "(disabled)",
+                "gps_device": (
+                    str(gps.get("label") or gps.get("device") or "(disabled)")
+                    if gps
+                    else "(disabled)"
+                ),
+                "hop_rate": hop_rate,
+                "outdir": str(outdir),
+                "kismet_version": version,
+                "http_port": http_port,
+            }
             capture_loop(
                 client,
                 proc,
                 args.duration or None,
                 hop_log=hop_log,
                 hop_rate=hop_rate,
+                survey=survey,
+                use_tui=not args.no_tui,
             )
     finally:
         if hop_log is not None:
