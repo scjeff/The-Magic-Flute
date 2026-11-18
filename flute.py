@@ -403,6 +403,17 @@ def run_cmd(
     except FileNotFoundError:
         exe = args[0] if args else ""
         return subprocess.CompletedProcess(args, 127, "", f"{exe}: not found\n")
+    except subprocess.TimeoutExpired as exc:
+        # Callers treat this as a finished command. A hung helper must not
+        # abort setup or the capture plan.
+        out = exc.stdout or ""
+        err = exc.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", errors="replace")
+        name = args[0] if args else "command"
+        return subprocess.CompletedProcess(args, 124, out, f"{err}{name}: timed out\n")
 
 
 def kismet_version(kismet_bin: str) -> str:
@@ -1187,7 +1198,10 @@ def classify_mac_kind(mac: str, phy: str = "", dtype: str = "") -> str:
             return "ble-rpa"
         if msbs == 3:
             return "ble-static-random"
-        if msbs == 0 and local:
+        # Top bits 00 are a non-resolvable private address. The universal bit
+        # is random there too, so a clear U/L bit is not a public OUI. An
+        # IEEE hit can still promote the row later.
+        if msbs == 0:
             return "ble-nrpa"
         if local:
             return "ble-random"
@@ -1285,7 +1299,11 @@ def vendor_from_uuids(uuids: list[int]) -> str:
 
 
 def _parse_btle_adv_payload(pdu: bytes) -> dict[str, Any] | None:
-    """ADV_IND / ADV_NONCONN / SCAN_RSP / ADV_SCAN_IND: AdvA + AD structures."""
+    """ADV_IND / ADV_NONCONN / SCAN_RSP / ADV_SCAN_IND: AdvA + AD structures.
+
+    AdvA is on the air least-significant octet first. The returned MAC is
+    display order, the same order Kismet stores on the device row.
+    """
     if len(pdu) < 8:
         return None
     hdr = pdu[0]
@@ -1293,37 +1311,39 @@ def _parse_btle_adv_payload(pdu: bytes) -> dict[str, Any] | None:
     if ptype not in {0x00, 0x02, 0x04, 0x06}:
         return None
     length = pdu[1] & 0x3F
-    body = pdu[2:]
-    if length:
-        body = body[:length]
+    # Legacy advertising payloads are 6 to 37 bytes. A zero length is the
+    # flags field that follows the reference access address, not a PDU.
+    if length < 6 or length > 37:
+        return None
+    body = pdu[2 : 2 + length]
     if len(body) < 6:
         return None
-    mac = ":".join(f"{b:02X}" for b in body[:6])
+    mac = ":".join(f"{b:02X}" for b in reversed(body[:6]))
     fields = parse_ble_ad_fields(body[6:])
     fields["mac"] = mac
     return fields
 
 
 def parse_ubertooth_or_btle_packet(blob: bytes) -> dict[str, Any] | None:
-    """Pull AdvA + AD from a Kismet BTLE/Ubertooth packet blob."""
+    """Pull AdvA + AD from a Kismet BTLE or Ubertooth packet blob.
+
+    The LE coding header stores the access address twice: once as the
+    reference value, then again in front of the PDU. Only a PDU that follows
+    an access address is accepted, so a Wi-Fi radiotap header is not read as
+    an advertisement.
+    """
     if not blob:
         return None
     aa = bytes.fromhex("d6be898e")
-    idx = blob.find(aa)
-    if idx >= 0:
+    start = 0
+    while True:
+        idx = blob.find(aa, start)
+        if idx < 0:
+            return None
         parsed = _parse_btle_adv_payload(blob[idx + 4 :])
         if parsed:
             return parsed
-    # usb_pkt_rx: 14-byte header then 50-byte data (Ubertooth)
-    if len(blob) >= 22:
-        parsed = _parse_btle_adv_payload(blob[14:])
-        if parsed:
-            return parsed
-        if blob[14:18] == aa:
-            parsed = _parse_btle_adv_payload(blob[18:])
-            if parsed:
-                return parsed
-    return _parse_btle_adv_payload(blob)
+        start = idx + 1
 
 
 def extract_btle_advertisements_from_db(db_path: Path) -> dict[str, dict[str, Any]]:
@@ -1343,14 +1363,31 @@ def extract_btle_advertisements_from_db(db_path: Path) -> dict[str, dict[str, An
         conn.close()
         return by_mac
     try:
-        cur.execute("SELECT packet, sourcemac FROM packets WHERE packet IS NOT NULL")
+        cur.execute(
+            "SELECT packet, sourcemac, phyname, dlt FROM packets WHERE packet IS NOT NULL"
+        )
+        keyed = True
     except sqlite3.Error:
-        conn.close()
-        return by_mac
+        try:
+            cur.execute("SELECT packet, sourcemac FROM packets WHERE packet IS NOT NULL")
+            keyed = False
+        except sqlite3.Error:
+            conn.close()
+            return by_mac
     for row in cur.fetchall():
         blob = row["packet"]
         if not isinstance(blob, (bytes, bytearray)):
             continue
+        if keyed:
+            phy = str(row["phyname"] or "")
+            try:
+                dlt = int(row["dlt"])
+            except (TypeError, ValueError):
+                dlt = -1
+            # 256 is the LE link-layer header. Wi-Fi frames are a different DLT
+            # and must not donate advertisement fields to a device.
+            if dlt != 256 and phy not in {"BTLE", "Bluetooth"}:
+                continue
         parsed = parse_ubertooth_or_btle_packet(bytes(blob))
         if not parsed:
             continue
@@ -4274,6 +4311,17 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
             writer.writerow(row)
 
 
+def is_bluetooth_record(rec: dict[str, Any]) -> bool:
+    """True for BTLE, BR/EDR, and Kismet types such as 'BTLE Tracker'."""
+    phy = str(rec.get("phy") or "").lower()
+    dtype = str(rec.get("type") or "").lower()
+    if phy in {"btle", "br/edr", "le"} or "blue" in phy:
+        return True
+    if dtype in {"btle", "br/edr", "classic"} or dtype.startswith("btle"):
+        return True
+    return "br/edr" in dtype
+
+
 def summarize_devices(devices: list[dict[str, Any]]) -> dict[str, int]:
     summary = {
         "total": len(devices),
@@ -4289,10 +4337,8 @@ def summarize_devices(devices: list[dict[str, Any]]) -> dict[str, int]:
         "ble_random": 0,
     }
     for rec in devices:
-        phy = str(rec.get("phy") or "").lower()
         dtype = str(rec.get("type") or "").lower()
-        is_bt = "blue" in phy or dtype in {"btle", "br/edr", "classic"}
-        if is_bt:
+        if is_bluetooth_record(rec):
             summary["bluetooth"] += 1
         else:
             summary["wifi"] += 1
@@ -4331,18 +4377,8 @@ def write_reports(outdir: Path, payload: dict[str, Any]) -> None:
     track: list[dict[str, Any]] = payload.get("gps_track") or []
     fields = csv_fields()
     write_csv(csv_all, devices, fields)
-    wifi = [
-        d
-        for d in devices
-        if "blue" not in str(d.get("phy") or "").lower()
-        and str(d.get("type") or "").lower() not in {"btle", "br/edr"}
-    ]
-    bluetooth = [
-        d
-        for d in devices
-        if "blue" in str(d.get("phy") or "").lower()
-        or str(d.get("type") or "").lower() in {"btle", "br/edr"}
-    ]
+    bluetooth = [d for d in devices if is_bluetooth_record(d)]
+    wifi = [d for d in devices if not is_bluetooth_record(d)]
     write_csv(csv_wifi, wifi, fields)
     write_csv(csv_bt, bluetooth, fields)
     if track:
@@ -5982,17 +6018,20 @@ def run_self_test() -> int:
     import importlib.util
     import unittest
 
-    path = Path(__file__).resolve().parent / "tests" / "test_live_dashboard.py"
-    if not path.is_file():
-        log(f"Missing {path}", "err")
+    root = Path(__file__).resolve().parent
+    paths = sorted((root / "tests").glob("test_*.py"))
+    if not paths:
+        log(f"No tests under {root / 'tests'}", "err")
         return 1
-    spec = importlib.util.spec_from_file_location("test_live_dashboard", path)
-    if spec is None or spec.loader is None:
-        log(f"Could not load {path}", "err")
-        return 1
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+    suite = unittest.TestSuite()
+    for path in paths:
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        if spec is None or spec.loader is None:
+            log(f"Could not load {path}", "err")
+            return 1
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
